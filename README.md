@@ -23,8 +23,9 @@ hole 中途留白、artifact 交付），由 `/workflow` 技能命令触发，�
 | `src/engine/world.ts` | 只读世界：glob（≤2000）/grep（≤2000 行、256KB）/read（≤2MB）、git 只读视图（status/changedFiles/diff≤512KB/log≤100）、world.run（无 shell、16MiB cap、discard/tail、timeout），超限拒绝而非截断 |
 | `src/engine/artifacts.ts` | artifact：file/markdown 版本化落 `.zcode-workflow/artifacts/<runId>/`；chart/table/metrics/board 预设由 `report(item, id)` 喂成 data.json + 渲染 markdown |
 | `src/engine/store.ts` | 落盘布局（见下）；saved workflow（`/* zcode-workflow` 元数据块 + 参数声明校验） |
-| `src/tools.ts` + `src/index.ts` | 12 个模型工具（`defineToolPlugin` + factory 取 api），manifest `skills: ["./skills"]` 携带技能包 |
-| `skills/workflow/` | 迁移的 skill 包：`SKILL.md`（写作契约全文改编）、`patterns.md`（拓扑目录）、`examples.md`（完整示例） |
+| `src/engine/dashboard.ts` | 仪表盘快照读取器：meta + journal 尾部 → run 状态 JSON（阶段时间线、计数、日志、等待横幅） |
+| `src/tools.ts` + `src/index.ts` | 13 个模型工具 + `zcode-workflow.dashboard` gateway 方法（单入口 `definePluginEntry`，绑定校验要求方法在 register 期间注册） |
+| `skills/workflow/` | 迁移的 skill 包：`SKILL.md`（写作契约全文改编 + §17 仪表盘章节）、`patterns.md`（拓扑目录）、`examples.md`（完整示例）、`dashboard.html`（状态面板 widget） |
 
 ### 工具面（对应 zcode 工具）
 
@@ -38,6 +39,26 @@ hole 中途留白、artifact 交付），由 `/workflow` 技能命令触发，�
 | `workflow_resolve_question`（答案送入子代理会话，作为该 ask 的结果入 journal） | `ResolveWorkflowQuestion` |
 | `workflow_eval_snippet`（同步、零持久化、snippet facade） | `EvalWorkflowSnippet` |
 | `workflow_save` / `workflow_list_saved` | `SaveWorkflow` / `ListSavedWorkflows` |
+| `workflow_dashboard`（返回挂状态面板的 `show_widget` 参数） | zcode 确认对话框的实时 phase 图（宿主侧等价物） |
+
+### 实时状态面板（对应 zcode 的 workflow 状态面板）
+
+run 启动后模型按 SKILL §17 调 `workflow_dashboard { run_id }` 并把返回参数原样交给 `show_widget`
+（`pin: true`）挂到会话仪表盘。面板由插件声明的 dashboard 数据绑定驱动：
+
+```
+openclaw.plugin.json  dashboard.dataBindings[0] = { id: "runs", method: "zcode-workflow.dashboard" }
+                      → widget 授权 id: zcode-workflow.runs（会话权限 Full access 立即生效）
+skills/workflow/dashboard.html  每 2.5s 轮询绑定，渲染：
+  状态徽章（运行中/已完成/已出错/已停止/等待hole/等待提问/已被修订取代）+ 耗时
+  阶段时间线（✓/进行中）· asks/world.run/report/artifacts 计数
+  最近日志 · 最近上报结果 · hole/提问/错误横幅 · 最终结论
+```
+
+实测注意点：① `defineToolPlugin` 的 tool factory 运行晚于 dashboard 绑定校验，gateway 方法必须由
+`definePluginEntry.register()` 注册；② OpenClaw 的 Code Mode 桥只向调用方透传工具结果的
+`details`，工具实现把正文同时镜像进 `content` 与 `details.text`；③ 模板占位符未替换时 widget
+自愈为解析最新 run。
 
 ### 落盘布局（都在 agent 主 workspace 下）
 

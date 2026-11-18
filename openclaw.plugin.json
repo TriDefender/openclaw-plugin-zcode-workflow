@@ -16,6 +16,15 @@
   "skills": [
     "./skills"
   ],
+  "dashboard": {
+    "dataBindings": [
+      {
+        "id": "runs",
+        "method": "zcode-workflow.dashboard",
+        "description": "Live workflow run state for the /workflow status dashboard: run state, phase timeline, ask/report counters, recent logs, hole and escalation banners."
+      }
+    ]
+  },
   "version": "0.1.0",
   "contracts": {
     "tools": [
@@ -30,7 +39,8 @@
       "workflow_resolve_question",
       "workflow_eval_snippet",
       "workflow_save",
-      "workflow_list_saved"
+      "workflow_list_saved",
+      "workflow_dashboard"
     ]
   }
 }

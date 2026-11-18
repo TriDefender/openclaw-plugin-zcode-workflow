@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Type, type TSchema } from "typebox";
 import { compileWorkflow } from "./engine/compile.js";
 import { Journal } from "./engine/journal.js";
@@ -45,17 +46,22 @@ interface PendingPlan {
   createdAt: number;
 }
 
+// OpenClaw's Code Mode bridge surfaces only `details` to the calling program,
+// while native tool calls read `content`. Mirror the text into both so either
+// call path sees the full payload.
+const DETAILS_TEXT_CAP = 32 * 1024;
+
 function text(content: string, details?: Record<string, unknown>) {
   return {
     content: [{ type: "text" as const, text: content }],
-    details: { ok: true, ...details },
+    details: { ok: true, text: content.slice(0, DETAILS_TEXT_CAP), ...details },
   };
 }
 
 function failure(message: string, details?: Record<string, unknown>) {
   return {
     content: [{ type: "text" as const, text: message }],
-    details: { ok: false, ...details },
+    details: { ok: false, text: message.slice(0, DETAILS_TEXT_CAP), ...details },
   };
 }
 
@@ -200,6 +206,7 @@ export function buildToolDefs(): ToolDef[] {
             `Run started: ${meta.id} ("${meta.name}").`,
             `Script: ${plan.draftPath}`,
             `Wait for it with workflow_wait { run_id: "${meta.id}" }; snapshot anytime with workflow_get. Do not poll in a loop.`,
+            `Before waiting: call workflow_dashboard { run_id: "${meta.id}" } and immediately show_widget with its returned params (pin: true) so the user watches the live status panel.`,
           ].join("\n"),
           { runId: meta.id },
         );
@@ -293,7 +300,7 @@ export function buildToolDefs(): ToolDef[] {
           return text(settleText(meta, journal.reportedItems().length));
         }
         if (Date.now() >= deadline) {
-          return text(`Run ${runId} is still ${meta.state} after ${timeoutMs}ms. Call workflow_wait again later or workflow_get for a snapshot.`);
+          return text(`Run ${runId} is still ${meta.state} after ${timeoutMs}ms. Call workflow_wait again later or workflow_get for a snapshot. If no status panel is mounted yet, call workflow_dashboard { run_id: "${runId}" } and show_widget its params.`);
         }
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
@@ -682,6 +689,54 @@ export function buildToolDefs(): ToolDef[] {
         return `- ${s.decl.name} (${s.path}): ${s.decl.description}${args}`;
       });
       return text(lines.join("\n"));
+    },
+  });
+
+  // ---- workflow_dashboard ----
+  tool({
+    name: "workflow_dashboard",
+    label: "Workflow Status Dashboard",
+    description:
+      "Return the ready-to-use show_widget parameters that mount the LIVE status panel for a workflow run on the session dashboard (phases timeline, ask/report counters, recent logs, waiting-hole and escalation banners). Call it right after workflow_create confirm starts a run, then call show_widget exactly with the returned params and pin: true. The widget self-refreshes via the zcode-workflow.runs dashboard binding.",
+    parameters: Type.Object({
+      run_id: Type.Optional(Type.String({ description: "Run id; omitted = the most recent run in this workspace." })),
+    }),
+    handler: async (params, ctx) => {
+      const workspaceDir = workspaceOf(ctx);
+      const store = storeOf(ctx, workspaceDir);
+      let runId = params.run_id !== undefined ? String(params.run_id) : undefined;
+      if (!runId) {
+        const runs = await store.listRuns();
+        if (runs.length === 0) return failure("No workflow runs in this workspace yet.");
+        runId = runs[0]!.id;
+      }
+      const meta = await loadRun(store, runId);
+      const templatePath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "skills", "workflow", "dashboard.html");
+      let template: string;
+      try {
+        template = await fs.readFile(templatePath, "utf8");
+      } catch {
+        return failure(`Dashboard template missing at ${templatePath}.`);
+      }
+      const widgetCode = template.split("__RUN_ID__").join(runId);
+      const widgetParams = {
+        title: `Workflow: ${meta.name}`,
+        name: `zcode-workflow-${runId}`,
+        pin: true,
+        size: "md",
+        capabilities: { tools: ["zcode-workflow.runs"] },
+        widget_code: widgetCode,
+      };
+      const lines = [
+        `Call show_widget now with EXACTLY these parameters (JSON, pin: true mounts it on the session dashboard and the panel then self-refreshes every 2.5s):`,
+        "",
+        "```json",
+        JSON.stringify(widgetParams, null, 2),
+        "```",
+        "",
+        `Binding grant: zcode-workflow.runs (reads live state of run ${runId} — state, phase timeline, asks/reports counters, logs, hole/question banners).`,
+      ];
+      return text(lines.join("\n"), { runId, widgetParams });
     },
   });
 

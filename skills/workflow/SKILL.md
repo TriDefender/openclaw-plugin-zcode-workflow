@@ -748,7 +748,14 @@ the same `token`/source. This two-step flow is this host's confirmation
 window; the token expires after 30 minutes.
 
 On a clean compile and confirmation the run starts in the background and you
-get a run id. **Wait, don't poll**: `workflow_wait` blocks until the run
+get a run id. **Mount the status panel before waiting** (§17): call
+`workflow_dashboard { run_id }` and then `show_widget` exactly with its
+returned parameters (`pin: true`). The panel renders the phase timeline, the
+ask/report counters, recent logs and hole/escalation banners, and refreshes
+itself while the run goes — this host's equivalent of the confirmation dialog's
+live phase graph.
+
+**Wait, don't poll**: `workflow_wait` blocks until the run
 settles (completed / errored / stopped / waiting_hole / waiting_question) and
 returns the final `return` value and reported items. Do other work, unless the
 user asked you to wait. `workflow_get` is the instant snapshot — pending
@@ -1266,8 +1273,39 @@ before the hole replays from the journal at no cost.
 - `workflow_resume { run_id }` — resume a stopped/interrupted run unchanged;
   its journal replays everything that settled.
 - `workflow_resolve_question { question_id, answer }` — §14.
+- `workflow_dashboard { run_id? }` — §17: returns the exact `show_widget`
+  parameters (with the run id baked in and the binding grant declared) that
+  mount the live status panel.
 
 Everything the run leaves behind is in the workspace: run records and journals
 under `.zcode-workflow/runs/`, artifacts under `.zcode-workflow/artifacts/`,
 drafts under `.zcode-workflow/drafts/`, saved definitions under
 `.zcode-workflow/saved/`.
+
+## 17. The live status panel (dashboard)
+
+ZCode shows a run's phase graph while it executes; on this host the equivalent
+is a pinned dashboard widget the agent mounts itself. `workflow_dashboard { run_id }`
+returns ready-to-use `show_widget` parameters with the run id baked in; call
+`show_widget` with them (always `pin: true`) right after `workflow_create`
+confirm starts the run. The panel is fed by the plugin's `zcode-workflow.runs`
+dashboard data binding — a read-scoped gateway method — so it polls and
+re-renders live every 2.5 seconds without further tool calls:
+
+- run state badge (运行中 / 已完成 / 已出错 / 已停止 / 等待 hole / 等待提问) and elapsed time;
+- the phase timeline with the current phase highlighted;
+- counters: subagent asks, `world.run` executions, reported items, artifacts;
+- the recent `log(...)` lines and the latest reported items;
+- a banner when the run parks on a `hole` or an escalated question, with the
+  tool to resume (`workflow_fill_hole` / `workflow_resolve_question`);
+- the final `conclusion` when the run completes.
+
+Mount it in these moments: after starting a run (always), after filling a hole
+or answering a question if the panel is not already mounted, and when the user
+asks what a run is doing. If the user reports the panel shows "读取失败", the
+`zcode-workflow.runs` grant was not approved — re-mount with
+`capabilities: { tools: ["zcode-workflow.runs"] }` (workflow_dashboard's
+parameters already carry it) and, under Guarded/Read-only session modes, wait
+for the operator's approval. The inline transcript preview never receives
+grants; only the pinned dashboard copy reads live state. A session whose
+permission mode is Full access grants it immediately.
