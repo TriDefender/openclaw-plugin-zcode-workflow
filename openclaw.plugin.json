@@ -1,0 +1,36 @@
+{
+  "id": "zcode-workflow",
+  "name": "ZCode Workflow",
+  "description": "ZCode-style dynamic workflows for OpenClaw: typed TS scripts orchestrating subagents with world.run gates, channels, holes and artifacts (/workflow).",
+  "categories": [
+    "agent-orchestration"
+  ],
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "skills": [
+    "./skills"
+  ],
+  "version": "0.1.0",
+  "contracts": {
+    "tools": [
+      "workflow_create",
+      "workflow_wait",
+      "workflow_get",
+      "workflow_list",
+      "workflow_stop",
+      "workflow_amend",
+      "workflow_resume",
+      "workflow_fill_hole",
+      "workflow_resolve_question",
+      "workflow_eval_snippet",
+      "workflow_save",
+      "workflow_list_saved"
+    ]
+  }
+}
