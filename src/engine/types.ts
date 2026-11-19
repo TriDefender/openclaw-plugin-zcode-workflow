@@ -102,6 +102,8 @@ export interface RunMeta {
   id: string;
   name: string;
   state: RunState;
+  /** Agent that owns this run's subagent sessions. Stamped at start; never guessed later. */
+  agentId?: string;
   createdAt: string;
   updatedAt: string;
   /** Run this one amends, if any. */

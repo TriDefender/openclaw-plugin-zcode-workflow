@@ -3,8 +3,10 @@
  * OpenClaw subagent session; `ask()` maps to one background subagent run on
  * that session. Context is kept across asks, so a later round on the same
  * subagent is cheap. Concurrency is bounded by a semaphore (plus OpenClaw's
- * own subagent queue).
+ * own subagent queue). Session keys are `agent:<agentId>:subagent:…` so the
+ * child stays out of the sidebar; the semaphore is sized to that lane.
  */
+import { subagentSessionKey } from "./scope.js";
 
 /** The slice of OpenClaw's plugin runtime the engine needs. */
 export interface SubagentRuntime {
@@ -49,15 +51,6 @@ export interface Persona {
 
 const ASK_WAIT_CHUNK_MS = 60_000;
 
-function sessionKeyFor(baseRunId: string, agentName: string | undefined, ordinal: number): string {
-  const slug = (agentName ?? "")
-    .replace(/[^A-Za-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48);
-  const suffix = slug.length > 0 ? slug : `anon-${ordinal}`;
-  return `agent:main:zcode-workflow:${baseRunId}:${suffix}`;
-}
-
 export class SubagentPool {
   /** name (or synthetic) → per-agent ask counter, for journal cache indexes. */
   private askCounts = new Map<string, number>();
@@ -66,6 +59,7 @@ export class SubagentPool {
   constructor(
     private readonly runtime: SubagentRuntime,
     private readonly runId: string,
+    private readonly agentId: string,
     private readonly workspaceDir: string | undefined,
     private readonly defaultModel: string | undefined,
     private readonly semaphore: Semaphore,
@@ -97,7 +91,7 @@ export class SubagentPool {
     persona: Persona | undefined,
     message: string,
   ): Promise<string> {
-    const sessionKey = sessionKeyFor(this.runId, name, ordinal);
+    const sessionKey = subagentSessionKey(this.agentId, this.runId, name, ordinal);
     const first = !this.askCounts.has(name ?? `#${ordinal}`) || (this.askCounts.get(name ?? `#${ordinal}`) ?? 0) === 0;
     const extraSystemPrompt = persona?.system;
     const modelParts = persona?.model?.includes("/") ? persona.model.split("/") : undefined;
@@ -134,7 +128,7 @@ export class SubagentPool {
 
   /** Direct continuation (used by workflow_resolve_question to answer an escalation in place). */
   async continueAsk(name: string | undefined, ordinal: number, message: string): Promise<string> {
-    const sessionKey = sessionKeyFor(this.runId, name, ordinal);
+    const sessionKey = subagentSessionKey(this.agentId, this.runId, name, ordinal);
     const release = await this.semaphore.acquire();
     try {
       const { runId: subRunId } = await this.runtime.run({ sessionKey, message, promptMode: "minimal", cwd: this.workspaceDir });

@@ -29,6 +29,13 @@
   "openclaw": {
     "extensions": [
       "./dist/index.js"
-    ]
-  }
+    ],
+    "compat": {
+      "pluginApi": ">=2026.10.4"
+    },
+    "build": {
+      "openclawVersion": "2026.11.5"
+    }
+  },
+  "license": "MIT"
 }

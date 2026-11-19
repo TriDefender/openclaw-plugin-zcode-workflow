@@ -14,6 +14,7 @@ import { compileWorkflow } from "./compile.js";
 import { Journal, stableKey } from "./journal.js";
 import { RunStore } from "./store.js";
 import { Semaphore, SubagentPool, type SubagentRuntime } from "./agents.js";
+import { resolveAskConcurrency } from "./scope.js";
 import { ArtifactPublisher } from "./artifacts.js";
 import { extractJson, validateAgainstSchema } from "./schema.js";
 import type { AskMeta, PendingQuestion, RunMeta } from "./types.js";
@@ -108,7 +109,17 @@ export class WorkflowRunner {
     private readonly subagents: SubagentRuntime,
     private readonly workspaceDir: string,
     private readonly logger: RunnerLogger,
+    private readonly readConfig: () => unknown,
   ) {}
+
+  private poolFor(meta: RunMeta): SubagentPool {
+    const agentId = meta.agentId;
+    if (!agentId) {
+      throw new WorkflowError(`run ${meta.id} has no owning agent`, "no_agent");
+    }
+    const limit = resolveAskConcurrency(this.readConfig(), agentId, meta.maxConcurrency);
+    return new SubagentPool(this.subagents, meta.id, agentId, this.workspaceDir, meta.subagentModel, new Semaphore(limit));
+  }
 
   isLive(runId: string): boolean {
     return this.live.has(runId);
@@ -152,7 +163,7 @@ export class WorkflowRunner {
    */
   async resolveQuestion(meta: RunMeta, question: PendingQuestion, answer: string): Promise<void> {
     const journal = await Journal.open(path.join(this.store.runDir(meta.id), "journal.jsonl"));
-    const pool = new SubagentPool(this.subagents, meta.id, this.workspaceDir, meta.subagentModel, new Semaphore(meta.maxConcurrency ?? 8));
+    const pool = this.poolFor(meta);
     const typed = question.askMeta;
     const continuation =
       `The requester answered your question:\n\n${answer}\n\n` +
@@ -236,7 +247,7 @@ export class WorkflowRunner {
       if (abortState.abortReason) throw new StopSignal(abortState.abortReason);
     };
 
-    const pool = new SubagentPool(this.subagents, meta.id, this.workspaceDir, meta.subagentModel, new Semaphore(meta.maxConcurrency ?? 8));
+    const pool = this.poolFor(meta);
     let agentOrdinal = 0;
     const holeMetaByName = new Map(compiled.meta.holes.map((h) => [h.name, h]));
 

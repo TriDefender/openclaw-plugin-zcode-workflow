@@ -13,7 +13,9 @@ import { Journal } from "./engine/journal.js";
 import { RunStore, validateSavedArgs } from "./engine/store.js";
 import { WorkflowRunner, type RunnerLogger } from "./engine/runner.js";
 import type { SubagentRuntime } from "./engine/agents.js";
+import { resolveOwningAgentId } from "./engine/scope.js";
 import { WorkflowError } from "./engine/types.js";
+import { workflowReportProps, type RunSnapshot } from "./engine/dashboard.js";
 import type { PendingQuestion, RunMeta, SavedWorkflowDeclaration } from "./engine/types.js";
 
 /** The slice of OpenClaw's plugin registration API this module uses. */
@@ -34,6 +36,8 @@ export interface ToolContext {
   pendingPlans: Map<string, PendingPlan>;
   /** Live runners by workspace directory. */
   runners: Map<string, WorkflowRunner>;
+  /** Session-bound facts captured by the v2 tool factory for this invocation. */
+  session?: { sessionKey?: string; agentId?: string; workspaceDir?: string; assertCurrent?: () => void };
 }
 
 interface PendingPlan {
@@ -65,8 +69,21 @@ function failure(message: string, details?: Record<string, unknown>) {
   };
 }
 
+function owningAgentId(ctx: ToolContext): string {
+  return resolveOwningAgentId(ctx.api.runtime.config.current(), {
+    agentId: ctx.session?.agentId,
+    sessionKey: ctx.session?.sessionKey,
+  });
+}
+
+function stampAgent(meta: RunMeta, ctx: ToolContext): void {
+  if (!meta.agentId) meta.agentId = owningAgentId(ctx);
+}
+
 function workspaceOf(ctx: ToolContext): string {
-  return ctx.api.runtime.agent.resolveAgentWorkspaceDir(ctx.api.runtime.config.current(), "main");
+  const fromTurn = ctx.session?.workspaceDir?.trim();
+  if (fromTurn) return fromTurn;
+  return ctx.api.runtime.agent.resolveAgentWorkspaceDir(ctx.api.runtime.config.current(), owningAgentId(ctx));
 }
 
 function storeOf(ctx: ToolContext, workspaceDir: string): RunStore {
@@ -76,7 +93,13 @@ function storeOf(ctx: ToolContext, workspaceDir: string): RunStore {
 function runnerOf(ctx: ToolContext, workspaceDir: string): WorkflowRunner {
   let runner = ctx.runners.get(workspaceDir);
   if (!runner) {
-    runner = new WorkflowRunner(new RunStore(workspaceDir), ctx.api.runtime.subagent, workspaceDir, ctx.api.logger);
+    runner = new WorkflowRunner(
+      new RunStore(workspaceDir),
+      ctx.api.runtime.subagent,
+      workspaceDir,
+      ctx.api.logger,
+      () => ctx.api.runtime.config.current(),
+    );
     ctx.runners.set(workspaceDir, runner);
   }
   return runner;
@@ -85,6 +108,34 @@ function runnerOf(ctx: ToolContext, workspaceDir: string): WorkflowRunner {
 async function readSourceFile(workspaceDir: string, relOrAbs: string): Promise<string> {
   const abs = path.isAbsolute(relOrAbs) ? relOrAbs : path.resolve(workspaceDir, relOrAbs);
   return fs.readFile(abs, "utf8");
+}
+
+/**
+ * Params for the core `dashboard` tool. Third-party plugins cannot call
+ * `runtime.gateway.request` (trusted/bundled only), and an HTML widget would
+ * load from a loopback-only sandbox origin. `session:report` is drawn by the
+ * Control UI itself, so remote clients never touch that port.
+ */
+function statusCardParams(run: RunSnapshot) {
+  return {
+    action: "widget_put" as const,
+    pluginKind: "session:report" as const,
+    name: `zcode-workflow-status-${run.id}`,
+    title: `Workflow: ${run.name}`.slice(0, 80),
+    props: workflowReportProps(run),
+    size: "xl" as const,
+  };
+}
+
+function statusCardText(run: RunSnapshot): string {
+  const dashboardParams = statusCardParams(run);
+  return [
+    `Call the core dashboard tool NOW with exactly these parameters. It mounts a native session:report card (no iframe, no sandbox port) named ${dashboardParams.name}. Reuse the same name to refresh it.`,
+    "",
+    "```json",
+    JSON.stringify(dashboardParams, null, 2),
+    "```",
+  ].join("\n");
 }
 
 function planText(meta: RunMeta, notes: string[]): string {
@@ -163,7 +214,7 @@ export function buildToolDefs(): ToolDef[] {
       name: Type.Optional(Type.String({ description: "Short run label in the user's language, e.g. \"PR review\" / \"代码评审\"." })),
       confirm: Type.Optional(Type.Boolean({ description: "true to start the run whose plan token you hold." })),
       token: Type.Optional(Type.String({ description: "The plan token from the previous call." })),
-      max_concurrency: Type.Optional(Type.Number({ description: "Upper bound on concurrent subagent asks. Set only when the user asks." })),
+      max_concurrency: Type.Optional(Type.Number({ description: "Upper bound on concurrent subagent asks. Omit to use the configured OpenClaw subagent lane (maxConcurrent and maxChildrenPerAgent). A number cannot exceed that lane." })),
       subagent_model: Type.Optional(Type.String({ description: "providerId/modelId or bare model id for subagents. Set only when the user asks." })),
     }),
     handler: async (params, ctx) => {
@@ -182,6 +233,7 @@ export function buildToolDefs(): ToolDef[] {
         ctx.pendingPlans.delete(token);
         const meta: RunMeta = {
           id: store.newRunId(),
+          agentId: owningAgentId(ctx),
           name: plan.name,
           state: "running",
           createdAt: new Date().toISOString(),
@@ -206,7 +258,7 @@ export function buildToolDefs(): ToolDef[] {
             `Run started: ${meta.id} ("${meta.name}").`,
             `Script: ${plan.draftPath}`,
             `Wait for it with workflow_wait { run_id: "${meta.id}" }; snapshot anytime with workflow_get. Do not poll in a loop.`,
-            `Before waiting: call workflow_dashboard { run_id: "${meta.id}" } and immediately show_widget with its returned params (pin: true) so the user watches the live status panel.`,
+            `Before waiting: call workflow_dashboard { run_id: "${meta.id}" } and immediately pass its JSON to the core dashboard tool (widget_put, pluginKind session:report). Do not use show_widget or dashboard.html.`, 
           ].join("\n"),
           { runId: meta.id },
         );
@@ -282,7 +334,7 @@ export function buildToolDefs(): ToolDef[] {
   tool({
     name: "workflow_wait",
     label: "Wait for Workflow",
-    description: "Block until a run this session started settles (completed/errored/stopped/waiting_hole/waiting_question), or the timeout passes. Returns the final result and reported items.",
+    description: "Block until a run this session started settles (completed/errored/stopped/waiting_hole/waiting_question), or the timeout passes. Returns the final result and reported items. When it returns, call workflow_dashboard and apply its dashboard params to refresh the native status card.",
     parameters: Type.Object({
       run_id: Type.String({ description: "Run id from workflow_create." }),
       timeout_ms: Type.Optional(Type.Number({ description: "Wait budget in ms; default 300000, max 1800000." })),
@@ -297,10 +349,18 @@ export function buildToolDefs(): ToolDef[] {
         const meta = await loadRun(store, runId);
         if (TERMINAL_STATES.has(meta.state)) {
           const journal = await Journal.open(path.join(store.runDir(runId), "journal.jsonl"));
-          return text(settleText(meta, journal.reportedItems().length));
+          return text(
+            [
+              settleText(meta, journal.reportedItems().length),
+              "",
+              `Refresh the native status card with workflow_dashboard { run_id: "${runId}" }, then call dashboard with the returned params.`,
+            ].join("\n"),
+          );
         }
         if (Date.now() >= deadline) {
-          return text(`Run ${runId} is still ${meta.state} after ${timeoutMs}ms. Call workflow_wait again later or workflow_get for a snapshot. If no status panel is mounted yet, call workflow_dashboard { run_id: "${runId}" } and show_widget its params.`);
+          return text(
+            `Run ${runId} is still ${meta.state} after ${timeoutMs}ms. Call workflow_wait again later, or workflow_dashboard { run_id: "${runId}" } and apply its dashboard params to refresh the native card.`,
+          );
         }
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
@@ -457,6 +517,7 @@ export function buildToolDefs(): ToolDef[] {
         fills: old.fills,
         savedFrom: old.savedFrom,
       };
+      stampAgent(meta, ctx);
 
       // stop the predecessor if it is live
       runner.stop(old.id, "model");
@@ -501,6 +562,7 @@ export function buildToolDefs(): ToolDef[] {
       if (meta.state === "waiting_hole") return failure(`Run ${meta.id} is waiting at hole ${meta.pendingHole?.id ?? "?"}; fill it with workflow_fill_hole.`);
       if (meta.state === "waiting_question") return failure(`Run ${meta.id} is waiting on ${meta.pendingQuestions.length} question(s); answer with workflow_resolve_question.`);
       if (meta.state === "superseded") return failure(`Run ${meta.id} was superseded.`);
+      stampAgent(meta, ctx);
       meta.state = "running";
       meta.updatedAt = new Date().toISOString();
       await store.saveMeta(meta);
@@ -554,6 +616,7 @@ export function buildToolDefs(): ToolDef[] {
       }
 
       await store.saveFill(meta.id, hole.name, source);
+      stampAgent(meta, ctx);
       meta.fills = nextFills;
       meta.state = "running";
       meta.pendingHole = undefined;
@@ -584,6 +647,7 @@ export function buildToolDefs(): ToolDef[] {
       const owner = runs.find((r) => r.pendingQuestions.some((q) => q.id === questionId));
       if (!owner) return failure(`No pending question "${questionId}". workflow_get lists a run's pendingQuestions.`);
       const question = owner.pendingQuestions.find((q) => q.id === questionId)!;
+      stampAgent(owner, ctx);
       await runner.resolveQuestion(owner, question, String(params.answer ?? ""));
       runner.start(owner);
       return text(`Answer delivered to "${question.agentName ?? "anonymous"}"; run ${owner.id} continues. Wait with workflow_wait.`);
@@ -692,12 +756,12 @@ export function buildToolDefs(): ToolDef[] {
     },
   });
 
-  // ---- workflow_dashboard ----
+  // ---- workflow_dashboard (native session:report card, no HTML) ----
   tool({
     name: "workflow_dashboard",
     label: "Workflow Status Dashboard",
     description:
-      "Return the ready-to-use show_widget parameters that mount the LIVE status panel for a workflow run on the session dashboard (phases timeline, ask/report counters, recent logs, waiting-hole and escalation banners). Call it right after workflow_create confirm starts a run, then call show_widget exactly with the returned params and pin: true. The widget self-refreshes via the zcode-workflow.runs dashboard binding.",
+      "Return core dashboard widget_put parameters for a native session:report status card (no iframe, no sandbox port): state, elapsed time, phase table, ask/report counters, recent logs, hole/question banners, final conclusion. Call it right after workflow_create confirm, then call the dashboard tool with the returned JSON in the same turn. Reuse the same widget name to refresh. Do not use show_widget or dashboard.html.",
     parameters: Type.Object({
       run_id: Type.Optional(Type.String({ description: "Run id; omitted = the most recent run in this workspace." })),
     }),
@@ -711,32 +775,11 @@ export function buildToolDefs(): ToolDef[] {
         runId = runs[0]!.id;
       }
       const meta = await loadRun(store, runId);
-      const templatePath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "skills", "workflow", "dashboard.html");
-      let template: string;
-      try {
-        template = await fs.readFile(templatePath, "utf8");
-      } catch {
-        return failure(`Dashboard template missing at ${templatePath}.`);
-      }
-      const widgetCode = template.split("__RUN_ID__").join(runId);
-      const widgetParams = {
-        title: `Workflow: ${meta.name}`,
-        name: `zcode-workflow-${runId}`,
-        pin: true,
-        size: "md",
-        capabilities: { tools: ["zcode-workflow.runs"] },
-        widget_code: widgetCode,
-      };
-      const lines = [
-        `Call show_widget now with EXACTLY these parameters (JSON, pin: true mounts it on the session dashboard and the panel then self-refreshes every 2.5s):`,
-        "",
-        "```json",
-        JSON.stringify(widgetParams, null, 2),
-        "```",
-        "",
-        `Binding grant: zcode-workflow.runs (reads live state of run ${runId} — state, phase timeline, asks/reports counters, logs, hole/question banners).`,
-      ];
-      return text(lines.join("\n"), { runId, widgetParams });
+      const { snapshotRun } = await import("./engine/dashboard.js");
+      const run = await snapshotRun(workspaceDir, meta.id);
+      if (!run) return failure(`No snapshot for run ${meta.id}.`);
+      const dashboardParams = statusCardParams(run);
+      return text(statusCardText(run), { dashboardParams });
     },
   });
 

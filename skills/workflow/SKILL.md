@@ -1055,8 +1055,11 @@ with `workflow_wait`.
 - `name`: a short label for the run in the user's language ("PR review",
   "代码评审"). Always pass it for an inline script; it labels the run everywhere
   and names its draft file. It defaults to the saved workflow's name.
-- `max_concurrency`: an upper bound on how many subagent asks work at once
-  (default 8). Set it only when the user asks to limit parallelism.
+- `max_concurrency`: an upper bound on how many subagent asks work at once.
+  Omit it to use the tighter of `agents.defaults.subagents.maxConcurrent` and
+  `maxChildrenPerAgent` (a per-agent `subagents` override wins). A number you
+  set cannot go above that lane. Set it only when the user asks to limit
+  parallelism.
 - `subagent_model`: the model the subagents run on, as `providerId/modelId` or
   a bare model id. Set it only when the user asks for a specific model; never
   a provider the user did not name. On this host overrides additionally need
@@ -1273,39 +1276,36 @@ before the hole replays from the journal at no cost.
 - `workflow_resume { run_id }` — resume a stopped/interrupted run unchanged;
   its journal replays everything that settled.
 - `workflow_resolve_question { question_id, answer }` — §14.
-- `workflow_dashboard { run_id? }` — §17: returns the exact `show_widget`
-  parameters (with the run id baked in and the binding grant declared) that
-  mount the live status panel.
+- `workflow_dashboard { run_id? }` — §17: returns exact core `dashboard`
+  `widget_put` parameters for a native `session:report` card. Call `dashboard`
+  with them in the same turn. Do not use `show_widget`.
 
 Everything the run leaves behind is in the workspace: run records and journals
 under `.zcode-workflow/runs/`, artifacts under `.zcode-workflow/artifacts/`,
 drafts under `.zcode-workflow/drafts/`, saved definitions under
 `.zcode-workflow/saved/`.
 
-## 17. The live status panel (dashboard)
+## 17. The live status card (native dashboard)
 
-ZCode shows a run's phase graph while it executes; on this host the equivalent
-is a pinned dashboard widget the agent mounts itself. `workflow_dashboard { run_id }`
-returns ready-to-use `show_widget` parameters with the run id baked in; call
-`show_widget` with them (always `pin: true`) right after `workflow_create`
-confirm starts the run. The panel is fed by the plugin's `zcode-workflow.runs`
-dashboard data binding — a read-scoped gateway method — so it polls and
-re-renders live every 2.5 seconds without further tool calls:
+ZCode shows a run's phase graph while it executes. On this host the equivalent
+is a native `session:report` card (`<openclaw-report-widget>`, previewSafe).
+The Control UI draws it from the board snapshot. There is no HTML document,
+no widget sandbox, and no loopback port, so Tailscale and other remote
+Control UI clients can see it.
 
-- run state badge (运行中 / 已完成 / 已出错 / 已停止 / 等待 hole / 等待提问) and elapsed time;
-- the phase timeline with the current phase highlighted;
-- counters: subagent asks, `world.run` executions, reported items, artifacts;
-- the recent `log(...)` lines and the latest reported items;
-- a banner when the run parks on a `hole` or an escalated question, with the
-  tool to resume (`workflow_fill_hole` / `workflow_resolve_question`);
-- the final `conclusion` when the run completes.
+`workflow_dashboard { run_id }` does not mount the card itself (this plugin is
+not a trusted gateway caller). It returns the exact core `dashboard` parameters:
 
-Mount it in these moments: after starting a run (always), after filling a hole
-or answering a question if the panel is not already mounted, and when the user
-asks what a run is doing. If the user reports the panel shows "读取失败", the
-`zcode-workflow.runs` grant was not approved — re-mount with
-`capabilities: { tools: ["zcode-workflow.runs"] }` (workflow_dashboard's
-parameters already carry it) and, under Guarded/Read-only session modes, wait
-for the operator's approval. The inline transcript preview never receives
-grants; only the pinned dashboard copy reads live state. A session whose
-permission mode is Full access grants it immediately.
+- `action: "widget_put"`
+- `pluginKind: "session:report"`
+- stable `name`: `zcode-workflow-status-<runId>`
+- `props.blocks`: metrics, phase table, recent logs, hole/question text, conclusion
+
+Call `dashboard` with that JSON in the same turn. Reuse the same `name` to
+refresh. Do not call `show_widget`, and do not mount `skills/workflow/dashboard.html`
+— that file is retired because its sandbox origin is loopback-only.
+
+When `workflow_wait` returns (settled or timed out), call `workflow_dashboard`
+again and re-apply the params so the card matches the run. The card cannot
+poll; a native report updates only when `dashboard` writes new props, which
+the Control UI receives on its existing gateway connection.

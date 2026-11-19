@@ -14,6 +14,7 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildToolDefs, type ToolContext, type ToolDef, type ToolHostApi } from "./tools.js";
 import { listRunSummaries, readRunSnapshot } from "./engine/dashboard.js";
+import { resolveOwningAgentId } from "./engine/scope.js";
 
 const contexts = new WeakMap<object, ToolContext>();
 
@@ -49,7 +50,16 @@ function registerDashboardGatewayMethod(hostApi: ToolHostApi): void {
     "zcode-workflow.dashboard",
     async (opts) => {
       const cfg = hostApi.runtime.config.current();
-      const agentId = typeof opts.params.agentId === "string" && opts.params.agentId ? opts.params.agentId : "main";
+      let agentId: string;
+      try {
+        agentId = resolveOwningAgentId(cfg, {
+          agentId: typeof opts.params.agentId === "string" ? opts.params.agentId : undefined,
+          sessionKey: typeof opts.params.sessionKey === "string" ? opts.params.sessionKey : undefined,
+        });
+      } catch (err) {
+        opts.respond(false, undefined, { message: err instanceof Error ? err.message : String(err) });
+        return;
+      }
       let workspaceDir: string;
       try {
         workspaceDir = hostApi.runtime.agent.resolveAgentWorkspaceDir(cfg, agentId);
@@ -73,26 +83,37 @@ function registerDashboardGatewayMethod(hostApi: ToolHostApi): void {
 
 function registerTools(hostApi: ToolHostApi, defs: ToolDef[], ctx: ToolContext): void {
   const api = hostApi as unknown as {
-    registerTool: (tool: {
-      name: string;
-      label: string;
-      description: string;
-      parameters: unknown;
-      execute: (toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<{
-        content: { type: "text"; text: string }[];
-        details: Record<string, unknown>;
-      }>;
-    }) => void;
+    registerTool: (
+      factory: (turn: { agentId?: string; sessionKey?: string; workspaceDir?: string }) => {
+        name: string;
+        label: string;
+        description: string;
+        parameters: unknown;
+        execute: (toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<{
+          content: { type: "text"; text: string }[];
+          details: Record<string, unknown>;
+        }>;
+      },
+      opts?: { name?: string; workspaceAccess?: "execute" | boolean },
+    ) => void;
   };
   for (const def of defs) {
-    api.registerTool({
+    api.registerTool((turn) => ({
       name: def.name,
       label: def.label,
       description: def.description,
       parameters: def.parameters,
       async execute(_toolCallId, params) {
+        const bound: ToolContext = {
+          ...ctx,
+          session: {
+            agentId: typeof turn?.agentId === "string" ? turn.agentId : undefined,
+            sessionKey: typeof turn?.sessionKey === "string" ? turn.sessionKey : undefined,
+            workspaceDir: typeof turn?.workspaceDir === "string" ? turn.workspaceDir : undefined,
+          },
+        };
         try {
-          return await def.handler(params as Record<string, unknown>, ctx);
+          return await def.handler(params as Record<string, unknown>, bound);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           hostApi.logger.error(`workflow tool ${def.name} failed: ${message}`);
@@ -102,7 +123,7 @@ function registerTools(hostApi: ToolHostApi, defs: ToolDef[], ctx: ToolContext):
           };
         }
       },
-    });
+    }), { name: def.name, workspaceAccess: "execute" });
   }
 }
 
