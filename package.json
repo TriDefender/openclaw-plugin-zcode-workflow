@@ -1,6 +1,6 @@
 {
   "name": "openclaw-plugin-zcode-workflow",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ZCode-style programmatic constraint workflows (dynamic workflows) for OpenClaw: typed TS workflow scripts orchestrating subagents, with /workflow skill command.",
   "type": "module",
   "main": "./dist/index.js",

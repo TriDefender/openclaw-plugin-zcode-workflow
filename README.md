@@ -24,7 +24,7 @@ hole 中途留白、artifact 交付），由 `/workflow` 技能命令触发，�
 | `src/engine/artifacts.ts` | artifact：file/markdown 版本化落 `.zcode-workflow/artifacts/<runId>/`；chart/table/metrics/board 预设由 `report(item, id)` 喂成 data.json + 渲染 markdown |
 | `src/engine/store.ts` | 落盘布局（见下）；saved workflow（`/* zcode-workflow` 元数据块 + 参数声明校验） |
 | `src/engine/dashboard.ts` | 仪表盘快照读取器：meta + journal 尾部 → run 状态 JSON，再编成原生 `session:report` blocks |
-| `src/tools.ts` + `src/index.ts` | 13 个模型工具 + `zcode-workflow.dashboard` gateway 方法（单入口 `definePluginEntry`，绑定校验要求方法在 register 期间注册） |
+| `src/tools.ts` + `src/index.ts` | 13 个模型工具 + `zcode-workflow.dashboard` gateway 方法（入口 `defineToolPlugin` 声明静态 authoring metadata，register 包装保住 dashboard 绑定校验） |
 | `skills/workflow/` | 迁移的 skill 包：`SKILL.md`（写作契约全文改编 + §17 仪表盘章节）、`patterns.md`（拓扑目录）、`examples.md`（完整示例）、`dashboard.html`（状态面板 widget） |
 
 ### 工具面（对应 zcode 工具）

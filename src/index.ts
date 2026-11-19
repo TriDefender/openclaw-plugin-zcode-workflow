@@ -6,13 +6,15 @@
  * world.run/files/git/report/artifact) executed in a journaled sandbox, driven
  * by the workflow_* tools and the /workflow skill command.
  *
- * Single entry (definePluginEntry) because the dashboard data binding declared
- * in openclaw.plugin.json requires the gateway method `zcode-workflow.dashboard`
- * to be registered by this plugin during register() — tool factories run too
- * late for that validation.
+ * The entry is declared with defineToolPlugin so authoring surfaces
+ * (`openclaw plugins build` / `validate`, manifest generation, catalogs) can
+ * read the static tool metadata stamped on the entry. The dashboard data
+ * binding declared in openclaw.plugin.json requires the gateway method
+ * `zcode-workflow.dashboard` to exist by the end of register(), so the
+ * generated tool register is wrapped (not replaced) to keep that wiring.
  */
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { buildToolDefs, type ToolContext, type ToolDef, type ToolHostApi } from "./tools.js";
+import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
+import { buildToolDefs, type ToolContext, type ToolHostApi } from "./tools.js";
 import { listRunSummaries, readRunSnapshot } from "./engine/dashboard.js";
 import { resolveOwningAgentId } from "./engine/scope.js";
 
@@ -81,63 +83,69 @@ function registerDashboardGatewayMethod(hostApi: ToolHostApi): void {
   );
 }
 
-function registerTools(hostApi: ToolHostApi, defs: ToolDef[], ctx: ToolContext): void {
-  const api = hostApi as unknown as {
-    registerTool: (
-      factory: (turn: { agentId?: string; sessionKey?: string; workspaceDir?: string }) => {
-        name: string;
-        label: string;
-        description: string;
-        parameters: unknown;
-        execute: (toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<{
-          content: { type: "text"; text: string }[];
-          details: Record<string, unknown>;
-        }>;
-      },
-      opts?: { name?: string; workspaceAccess?: "execute" | boolean },
-    ) => void;
-  };
-  for (const def of defs) {
-    api.registerTool((turn) => ({
-      name: def.name,
-      label: def.label,
-      description: def.description,
-      parameters: def.parameters,
-      async execute(_toolCallId, params) {
-        const bound: ToolContext = {
-          ...ctx,
-          session: {
-            agentId: typeof turn?.agentId === "string" ? turn.agentId : undefined,
-            sessionKey: typeof turn?.sessionKey === "string" ? turn.sessionKey : undefined,
-            workspaceDir: typeof turn?.workspaceDir === "string" ? turn.workspaceDir : undefined,
-          },
-        };
-        try {
-          return await def.handler(params as Record<string, unknown>, bound);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          hostApi.logger.error(`workflow tool ${def.name} failed: ${message}`);
-          return {
-            content: [{ type: "text" as const, text: `${def.name} failed: ${message}` }],
-            details: { ok: false, error: message },
-          };
-        }
-      },
-    }), { name: def.name, workspaceAccess: "execute" });
-  }
-}
-
-export default definePluginEntry({
+const entry = defineToolPlugin({
   id: "zcode-workflow",
   name: "ZCode Workflow",
   description:
     "ZCode-style dynamic workflows for OpenClaw: typed TS scripts orchestrating subagents with world.run gates, channels, holes and artifacts (/workflow).",
-  register(api) {
-    const hostApi = api as unknown as ToolHostApi;
-    const ctx = contextFor(api);
-    // Dashboard binding validation requires the method to exist by the end of register().
-    registerDashboardGatewayMethod(hostApi);
-    registerTools(hostApi, buildToolDefs(), ctx);
-    hostApi.logger.info("zcode-workflow plugin registered: /workflow skill + 13 workflow_* tools + live status dashboard binding");
-  },
+  activation: { onStartup: true },
+  tools: (tool) =>
+    buildToolDefs().map((def) =>
+      tool({
+        name: def.name,
+        label: def.label,
+        description: def.description,
+        parameters: def.parameters,
+        workspaceAccess: "execute",
+        factory: ({ api, toolContext }) => {
+          const hostApi = api as unknown as ToolHostApi;
+          const ctx = contextFor(api);
+          const turn = toolContext as unknown as {
+            agentId?: unknown;
+            sessionKey?: unknown;
+            workspaceDir?: unknown;
+          } | undefined;
+          return {
+            name: def.name,
+            label: def.label,
+            description: def.description,
+            parameters: def.parameters,
+            async execute(_toolCallId: string, params: unknown) {
+              const bound: ToolContext = {
+                ...ctx,
+                session: {
+                  agentId: typeof turn?.agentId === "string" ? turn.agentId : undefined,
+                  sessionKey: typeof turn?.sessionKey === "string" ? turn.sessionKey : undefined,
+                  workspaceDir: typeof turn?.workspaceDir === "string" ? turn.workspaceDir : undefined,
+                },
+              };
+              try {
+                return await def.handler(params as Record<string, unknown>, bound);
+              } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                hostApi.logger.error(`workflow tool ${def.name} failed: ${message}`);
+                return {
+                  content: [{ type: "text" as const, text: `${def.name} failed: ${message}` }],
+                  details: { ok: false, error: message },
+                };
+              }
+            },
+          };
+        },
+      }),
+    ),
 });
+
+// Authoring metadata carries the static tools; the dashboard gateway method must
+// exist by the end of register() for the manifest binding validation, so wrap the
+// generated tool register instead of replacing it.
+const generatedRegister = entry.register;
+entry.register = (api) => {
+  const hostApi = api as unknown as ToolHostApi;
+  // Dashboard binding validation requires the method to exist by the end of register().
+  registerDashboardGatewayMethod(hostApi);
+  generatedRegister(api);
+  hostApi.logger.info("zcode-workflow plugin registered: /workflow skill + 13 workflow_* tools + live status dashboard binding");
+};
+
+export default entry;
