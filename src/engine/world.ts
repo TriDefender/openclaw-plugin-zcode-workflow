@@ -33,6 +33,42 @@ export function resolveInside(workspaceDir: string, relPath: string): string {
   return abs;
 }
 
+/**
+ * Symlink hardening on top of the lexical resolveInside check: refuse a
+ * symlink final component outright, and verify the real location of the
+ * deepest existing ancestor stays inside the workspace root. Without this,
+ * a workspace-internal symlink pointing outside would pass the lexical
+ * check and every follow-on stat/read/write would escape.
+ */
+export async function assertRealPathInside(workspaceDir: string, abs: string, relPath: string): Promise<void> {
+  const root = path.resolve(workspaceDir);
+  const inside = (p: string): boolean => p === root || p.startsWith(root + path.sep);
+  const lst = await fs.lstat(abs).catch(() => null);
+  if (lst?.isSymbolicLink()) {
+    throw new WorldCapError(`path "${relPath}" is a symlink; refusing`);
+  }
+  let probe = abs;
+  for (let i = 0; i < 64; i += 1) {
+    const real = await fs.realpath(probe).catch(() => null);
+    if (real !== null) {
+      if (!inside(real)) {
+        throw new WorldCapError(`path "${relPath}" resolves outside the workspace through a symlink`);
+      }
+      return;
+    }
+    const parent = path.dirname(probe);
+    if (parent === probe) return; // no existing ancestor above fs root
+    probe = parent;
+  }
+}
+
+/** Git refs and pathspecs go into argv directly: anything option-shaped is rejected. */
+export function assertGitArg(value: string, what: string): void {
+  if (value.startsWith("-")) {
+    throw new WorldCapError(`git ${what} must be a ref or workspace path, not an option (got "${value}")`);
+  }
+}
+
 /** Minimal glob: `*`, `**`, `?`, and `{a,b}` alternation, `/`-separated. */
 export function globToRegExp(pattern: string): RegExp {
   let re = "";
@@ -108,6 +144,7 @@ export async function filesRead(workspaceDir: string, relPath: string): Promise<
     throw new WorldCapError(`no such file: ${relPath}`);
   });
   if (!stat.isFile()) throw new WorldCapError(`not a file: ${relPath}`);
+  await assertRealPathInside(workspaceDir, abs, relPath);
   if (stat.size > READ_BYTES_CAP) {
     throw new WorldCapError(`file ${relPath} is ${stat.size} bytes (cap ${READ_BYTES_CAP})`);
   }
@@ -228,6 +265,7 @@ export async function gitStatus(workspaceDir: string) {
 export async function gitChangedFiles(workspaceDir: string, base?: string): Promise<string[]> {
   if (base !== undefined) {
     if (base.includes("..")) throw new WorldCapError("a base names a single ref; no '..' ranges");
+    assertGitArg(base, "base");
     const out = await gitExec(workspaceDir, ["diff", "--name-only", base], DIFF_BYTES_CAP);
     return out.split("\n").filter(Boolean).map((f) => f.trim());
   }
@@ -236,6 +274,8 @@ export async function gitChangedFiles(workspaceDir: string, base?: string): Prom
 }
 
 export async function gitDiff(workspaceDir: string, base?: string, relPath?: string): Promise<string> {
+  if (base) assertGitArg(base, "base");
+  if (relPath) assertGitArg(relPath, "path");
   const args = ["diff", ...(base ? [base] : ["HEAD"]), "--", ...(relPath ? [relPath] : [])];
   const out = await gitExec(workspaceDir, args, DIFF_BYTES_CAP);
   if (out.length > DIFF_BYTES_CAP) throw new WorldCapError(`diff over ${DIFF_BYTES_CAP} bytes`);

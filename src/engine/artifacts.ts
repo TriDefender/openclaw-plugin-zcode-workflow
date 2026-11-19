@@ -8,7 +8,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { assertSafeId } from "./store.js";
-import { FILE_ARTIFACT_BYTES_CAP, MARKDOWN_ARTIFACT_BYTES_CAP, WorldCapError, resolveInside } from "./world.js";
+import { FILE_ARTIFACT_BYTES_CAP, MARKDOWN_ARTIFACT_BYTES_CAP, WorldCapError, assertRealPathInside, resolveInside } from "./world.js";
 import { WorkflowError } from "./types.js";
 import type { RunMeta } from "./types.js";
 import type { Journal } from "./journal.js";
@@ -97,6 +97,7 @@ export class ArtifactPublisher {
       throw new WorldCapError(`artifact source missing: ${relPath}`);
     });
     if (!stat.isFile()) throw new WorldCapError(`artifact source is not a file: ${relPath}`);
+    await assertRealPathInside(this.workspaceDir, abs, relPath);
     if (stat.size > FILE_ARTIFACT_BYTES_CAP) {
       throw new WorldCapError(`artifact source ${relPath} is over the ${FILE_ARTIFACT_BYTES_CAP}-byte cap`);
     }
