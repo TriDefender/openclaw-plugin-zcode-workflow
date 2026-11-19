@@ -1309,3 +1309,37 @@ When `workflow_wait` returns (settled or timed out), call `workflow_dashboard`
 again and re-apply the params so the card matches the run. The card cannot
 poll; a native report updates only when `dashboard` writes new props, which
 the Control UI receives on its existing gateway connection.
+
+## 18. Background runs: fire, end the turn, recap automatically
+
+`workflow_create` already runs the workflow in the background. You do **not**
+need to block the conversation with `workflow_wait` unless the user is actively
+waiting for the result. To "confirm the launch, end the turn, and come back
+with a recap when the run settles":
+
+1. `workflow_create` → keep the returned `run_id` (`state=running`).
+2. Schedule a one-shot self-wakeup with the core `automations` tool:
+   ```
+   automations {
+     action: "add",
+     job: {
+       name: "workflow-recap-<runId>",
+       schedule: { kind: "at", at: "<now + 3 min, ISO-8601>" },
+       sessionTarget: "current",
+       deleteAfterRun: true,
+       payload: {
+         kind: "agentTurn",
+         message: "调 workflow_get {run_id:\"<runId>\"}。state=completed → 向用户总结 result 与关键 journal/ artifact；errored/stopped → 报告错误原文。仍 running/waiting_* → 调 automations {action:\"next_check\", in:\"2m\"} 续等（同一任务自动重挂）。"
+       }
+     }
+   }
+   ```
+3. End the turn with one line: launched, will recap automatically.
+4. The watcher turn runs in this same conversation: `workflow_get`, then recap
+   (or `next_check in:"2m"` to rearm the same one-shot job while still running;
+   `deleteAfterRun` cleans the job up once the recap turn completes).
+
+Long runs: set the first `at` generously (expected duration + margin); the
+`next_check` rearm loop handles overshoot. Never `exec sleep` or busy-poll
+`workflow_get` in the main turn. `workflow_wait` remains right when the user
+explicitly wants the answer in this turn (timeout still returns a snapshot).

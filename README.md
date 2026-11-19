@@ -11,6 +11,18 @@ hole 中途留白、artifact 交付），由 `/workflow` 技能命令触发，�
 模型加载 `skills/workflow/SKILL.md`（迁移自 zcode dynamic-workflows 的完整写作契约），按契约写脚本，
 调用 `workflow_create` 编译并确认，run 在后台执行并落 journal，`workflow_wait` 阻塞取回最终 return 值。
 
+## Security & Capability Model (English summary)
+
+This plugin's stated purpose is **deterministic gating of agent workflows**: it runs small type-checked TypeScript scripts that orchestrate OpenClaw subagents and can invoke a bounded "world" API. The capability surface below is intentional and documented here so scanners and reviewers can match it against that purpose.
+
+- **Process execution**: `world.run(cmd, args)` spawns child processes **without a shell**, using the Gateway process's own permissions. Args are passed as literal argv. Output is capped at 16 MiB **enforced incrementally during accumulation** (the child is killed once the cap is hit); `discard` and `tail:n` modes keep memory bounded; a timeout (default 5 min) kills runaway commands.
+- **Filesystem**: `files.glob/grep/read` are read-only and resolved strictly inside the agent workspace (`resolveInside`, traversal rejected). Writes go only to plugin state paths under `.zcode-workflow/` (runs, journals, artifacts), all with size caps. Run ids and artifact ids are validated as safe path segments (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, no `..`), so model- or script-supplied ids cannot traverse out of the store.
+- **git**: read-only views (`status`, `changedFiles`, `diff ≤ 512 KB`, `log ≤ 100`); git output is capped **while streaming**, not after completion.
+- **Network**: none directly from the facade; child processes may use the network with the Gateway user's permissions.
+- **Execution model**: scripts run in a `node:vm` context **inside the Gateway process** (same trust boundary as the gateway itself; the facade is the only global — no `require`, no `process`). CPU-bound script code can block the gateway event loop; the 120 s progress watchdog covers async stalls, not a tight sync loop. Run untrusted scripts on a dedicated sandboxed gateway if that matters for you.
+- **Secrets**: the facade exposes no environment variables or credentials to workflow scripts.
+- **Resource caps**: glob ≤ 2000 matches · grep ≤ 2000 matches / 256 KB · read ≤ 2 MB · git diff ≤ 512 KB / log ≤ 100 · run output ≤ 16 MiB (killed at cap) · artifact ≤ 1 MB (file) / 256 KB (markdown) · ≤ 16 versions per artifact.
+
 ## 组成
 
 | 部分 | 说明 |

@@ -7,6 +7,7 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
+import { assertSafeId } from "./store.js";
 import { FILE_ARTIFACT_BYTES_CAP, MARKDOWN_ARTIFACT_BYTES_CAP, WorldCapError, resolveInside } from "./world.js";
 import { WorkflowError } from "./types.js";
 import type { RunMeta } from "./types.js";
@@ -67,6 +68,7 @@ export class ArtifactPublisher {
   }
 
   declarePreset(id: string, kind: string, spec: Record<string, unknown>): void {
+    assertSafeId("artifact id", id);
     const existing = this.specs.get(id);
     const normalized = JSON.stringify(spec);
     if (existing) {
@@ -79,6 +81,7 @@ export class ArtifactPublisher {
   }
 
   markPrimary(meta: RunMeta, id: string, opts: { primary?: boolean }): void {
+    assertSafeId("artifact id", id);
     if (!opts.primary) return;
     if (this.primary && this.primary !== id) {
       throw new WorkflowError(`at most one artifact may be primary (already "${this.primary}")`, "bad_artifact");
@@ -88,6 +91,7 @@ export class ArtifactPublisher {
   }
 
   async publishFile(id: string, relPath: string, opts: { title?: string; description?: string; primary?: boolean; contentType?: string }): Promise<{ id: string; version: number }> {
+    assertSafeId("artifact id", id);
     const abs = resolveInside(this.workspaceDir, relPath);
     const stat = await fs.stat(abs).catch(() => {
       throw new WorldCapError(`artifact source missing: ${relPath}`);
@@ -112,6 +116,7 @@ export class ArtifactPublisher {
   }
 
   async publishMarkdown(id: string, content: string, opts: { title?: string; description?: string; primary?: boolean }): Promise<{ id: string; version: number }> {
+    assertSafeId("artifact id", id);
     if (content.length > MARKDOWN_ARTIFACT_BYTES_CAP) {
       throw new WorldCapError(`markdown artifact "${id}" is over the ${MARKDOWN_ARTIFACT_BYTES_CAP}-byte cap`);
     }
@@ -131,6 +136,7 @@ export class ArtifactPublisher {
 
   /** A report item tagged with a preset id: append to the data file and refresh the rendering. */
   async recordPresetItem(id: string, item: unknown): Promise<void> {
+    assertSafeId("artifact id", id);
     const entry = this.specs.get(id);
     if (!entry) return;
     const dataFile = path.join(this.artifactsDir, `${id}.data.json`);

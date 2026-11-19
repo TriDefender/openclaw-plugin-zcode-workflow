@@ -17,6 +17,21 @@ import { WorkflowError } from "./types.js";
 
 export const WORKFLOW_DIR = ".zcode-workflow";
 
+/**
+ * Validate model/script-supplied identifiers that are used as path segments
+ * (run ids, artifact ids, saved workflow names). Rejects path separators and
+ * traversal segments so every on-disk path stays inside the workflow store.
+ */
+export function assertSafeId(label: string, value: string): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) || value.includes("..")) {
+    throw new WorkflowError(
+      `${label} "${String(value).slice(0, 64)}" is not a safe identifier (letters, digits, dot, dash, underscore only; no "..")`,
+      "bad_name",
+    );
+  }
+  return value;
+}
+
 export class RunStore {
   constructor(readonly workspaceDir: string) {}
 
@@ -29,11 +44,11 @@ export class RunStore {
   }
 
   runDir(runId: string): string {
-    return this.root("runs", runId);
+    return this.root("runs", assertSafeId("runId", runId));
   }
 
   artifactsDir(runId: string): string {
-    return this.root("artifacts", runId);
+    return this.root("artifacts", assertSafeId("runId", runId));
   }
 
   draftsDir(): string {
@@ -109,8 +124,9 @@ export class RunStore {
   }
 
   async readFillFile(runId: string, relPath: string): Promise<string> {
-    const abs = path.resolve(this.runDir(runId), relPath);
-    if (!abs.startsWith(this.runDir(runId))) throw new WorkflowError("fill path escapes the run directory", "bad_path");
+    const runDirAbs = path.resolve(this.runDir(runId));
+    const abs = path.resolve(runDirAbs, relPath);
+    if (abs !== runDirAbs && !abs.startsWith(runDirAbs + path.sep)) throw new WorkflowError("fill path escapes the run directory", "bad_path");
     return fs.readFile(abs, "utf8");
   }
 
@@ -119,9 +135,7 @@ export class RunStore {
   async saveWorkflow(decl: SavedWorkflowDeclaration, script: string): Promise<string> {
     const dir = this.savedDir("project");
     await fs.mkdir(dir, { recursive: true });
-    if (!/^[A-Za-z0-9._-]+$/.test(decl.name)) {
-      throw new WorkflowError(`saved workflow name "${decl.name}" must be letters, digits, dot, dash and underscore`, "bad_name");
-    }
+    assertSafeId("saved workflow name", decl.name);
     const meta = [
       "/* zcode-workflow",
       `name: ${decl.name}`,

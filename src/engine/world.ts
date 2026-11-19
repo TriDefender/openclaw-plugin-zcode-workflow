@@ -167,19 +167,32 @@ async function gitExec(workspaceDir: string, args: string[], bytesCap: number): 
       const child = spawn("git", args, { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";
+      let settled = false;
+      const overCap = (): void => {
+        if (settled) return;
+        settled = true;
+        child.kill("SIGKILL");
+        reject(new WorldCapError(`git ${args[0]} output over ${bytesCap} bytes cap`));
+      };
       child.stdout!.on("data", (d: Buffer) => {
         stdout += d.toString("utf8");
+        if (stdout.length > bytesCap) overCap();
       });
       child.stderr!.on("data", (d: Buffer) => {
-        stderr += d.toString("utf8");
+        if (stderr.length < 65536) stderr += d.toString("utf8");
       });
-      child.on("error", reject);
+      child.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
       child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
         if (code !== 0) reject(new Error(`git ${args.join(" ")} exited ${code}: ${stderr.slice(0, 400)}`));
         else resolve(stdout);
       });
     });
-    if (out.length > bytesCap) throw new WorldCapError(`git ${args[0]} output over ${bytesCap} bytes cap`);
     return out;
   } catch (err) {
     if (err instanceof WorldCapError) throw err;
@@ -269,35 +282,49 @@ export async function worldRun(
     }
     let stdout = "";
     let stderr = "";
-    let overCap = false;
-    child.stdout!.on("data", (d: Buffer) => {
-      stdout += d.toString("utf8");
-      if (stdout.length > RUN_OUTPUT_CAP) overCap = true;
-    });
-    child.stderr!.on("data", (d: Buffer) => {
-      stderr += d.toString("utf8");
-      if (stderr.length > RUN_OUTPUT_CAP) overCap = true;
-    });
+    let settled = false;
+    const tailKeep = typeof output === "object" ? output.tail : 0;
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new WorldCapError(`command "${cmd}" timed out after ${timeoutMs}ms`));
+      finish(() => reject(new WorldCapError(`command "${cmd}" timed out after ${timeoutMs}ms`)));
     }, timeoutMs);
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(new WorldCapError(`spawn failed: ${err.message}`));
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (overCap && output === "full") {
-        reject(new WorldCapError(`output of "${cmd}" exceeded the ${RUN_OUTPUT_CAP}-byte cap; pass { output: "discard" } or { output: { tail: n } }`));
+    const onChunk = (stream: "stdout" | "stderr") => (d: Buffer): void => {
+      if (settled || output === "discard") return;
+      let buf = (stream === "stdout" ? stdout : stderr) + d.toString("utf8");
+      if (typeof output === "object") {
+        // tail mode: keep only the requested tail (bulk-trim past a slack window so slicing is rare)
+        if (buf.length > tailKeep + 65536) buf = buf.slice(-tailKeep);
+      } else if (buf.length > RUN_OUTPUT_CAP) {
+        // full mode: stop accumulating at the cap — kill the child instead of buffering past it
+        child.kill("SIGKILL");
+        finish(() =>
+          reject(new WorldCapError(`output of "${cmd}" exceeded the ${RUN_OUTPUT_CAP}-byte cap; pass { output: "discard" } or { output: { tail: n } }`)),
+        );
         return;
       }
-      const shape = (text: string): string => {
-        if (output === "discard") return "";
-        if (typeof output === "object") return text.length > output.tail ? text.slice(text.length - output.tail) : text;
-        return text;
-      };
-      resolve({ exitCode: code ?? 0, stdout: shape(stdout), stderr: shape(stderr) });
+      if (stream === "stdout") stdout = buf;
+      else stderr = buf;
+    };
+    child.stdout!.on("data", onChunk("stdout"));
+    child.stderr!.on("data", onChunk("stderr"));
+    child.on("error", (err) => {
+      finish(() => reject(new WorldCapError(`spawn failed: ${err.message}`)));
+    });
+    child.on("close", (code) => {
+      finish(() => {
+        const shape = (text: string): string => {
+          if (output === "discard") return "";
+          if (typeof output === "object") return text.length > output.tail ? text.slice(text.length - output.tail) : text;
+          return text;
+        };
+        resolve({ exitCode: code ?? 0, stdout: shape(stdout), stderr: shape(stderr) });
+      });
     });
   });
 }
