@@ -34,6 +34,8 @@ export interface ToolContext {
   pendingPlans: Map<string, PendingPlan>;
   /** Live runners by workspace directory. */
   runners: Map<string, WorkflowRunner>;
+  /** Session-bound facts captured by the v2 tool factory for this invocation. */
+  session?: { sessionKey?: string; agentId?: string; assertCurrent?: () => void };
 }
 
 interface PendingPlan {
@@ -85,6 +87,121 @@ function runnerOf(ctx: ToolContext, workspaceDir: string): WorkflowRunner {
 async function readSourceFile(workspaceDir: string, relOrAbs: string): Promise<string> {
   const abs = path.isAbsolute(relOrAbs) ? relOrAbs : path.resolve(workspaceDir, relOrAbs);
   return fs.readFile(abs, "utf8");
+}
+
+const REPORT_JSON_CAP = 8 * 1024;
+
+const STATE_LABELS: Record<string, string> = {
+  running: "运行中",
+  completed: "已完成",
+  errored: "已出错",
+  stopped: "已停止",
+  waiting_hole: "等待填充 hole",
+  waiting_question: "等待回答提问",
+  superseded: "已被修订取代",
+};
+
+interface RunSnapshotLike {
+  id: string;
+  name: string;
+  state: string;
+  elapsedMs?: number;
+  phasesSeen: string[];
+  askCount: number;
+  worldRunCount: number;
+  reportedCount: number;
+  recentLogs: string[];
+  pendingHole?: { id: string; name: string; prompt: string };
+  pendingQuestions: { id: string; agent: string; question: string }[];
+  error?: string;
+  result?: unknown;
+}
+
+/** Build the native session:report props (strict schema: blocks only, 8KB cap). */
+function buildReportBlocks(run: RunSnapshotLike): { blocks: Record<string, unknown>[] } {
+  const stateLabel = STATE_LABELS[run.state] ?? run.state;
+  const metrics: { label: string; value: string; detail?: string }[] = [
+    { label: "状态", value: stateLabel },
+    { label: "耗时", value: run.elapsedMs !== undefined ? fmtDuration(run.elapsedMs) : "—" },
+    { label: "子代理 asks", value: String(run.askCount) },
+    { label: "world.run", value: String(run.worldRunCount) },
+    { label: "report", value: String(run.reportedCount) },
+  ];
+  const blocks: Record<string, unknown>[] = [{ type: "metrics", items: metrics }];
+  if (run.phasesSeen.length > 0) {
+    const current = run.phasesSeen[run.phasesSeen.length - 1];
+    blocks.push({
+      type: "table",
+      title: "阶段",
+      columns: ["阶段", "状态"],
+      rows: run.phasesSeen.map((p) => [
+        p.slice(0, 500),
+        p === current && (run.state === "running" || run.state === "waiting_hole" || run.state === "waiting_question") ? "进行中" : "✓",
+      ]),
+    });
+  }
+  if (run.pendingHole) {
+    blocks.push({
+      type: "text",
+      title: `等待 hole：${run.pendingHole.name}`,
+      text: `${run.pendingHole.id}\n${run.pendingHole.prompt}`.slice(0, 4000).trim() || "（无提示）",
+    });
+  }
+  if (run.pendingQuestions.length > 0) {
+    blocks.push({
+      type: "text",
+      title: "子代理提问",
+      text: run.pendingQuestions.map((q) => `${q.agent}（${q.id}）：${q.question}`).join("\n").slice(0, 4000),
+    });
+  }
+  const logs = run.recentLogs.filter((l) => l.trim().length > 0).slice(-5);
+  if (logs.length > 0) {
+    blocks.push({ type: "text", title: "最近日志", text: logs.map((l) => `· ${l}`).join("\n").slice(0, 4000) });
+  }
+  if (run.state === "completed" && run.result != null) {
+    const result = run.result as Record<string, unknown>;
+    const conclusion = typeof result?.conclusion === "string" ? result.conclusion : JSON.stringify(run.result).slice(0, 2000);
+    blocks.push({ type: "text", title: "结论", text: conclusion.slice(0, 4000) });
+  }
+  if (run.state === "errored" && run.error) {
+    blocks.push({ type: "text", title: "错误", text: run.error.slice(0, 4000) });
+  }
+  return { blocks: blocks.slice(0, 24) };
+}
+
+function fmtDuration(ms: number): string {
+  const total = Math.floor(ms / 1000);
+  const m = Math.floor(total / 60);
+  const sec = total % 60;
+  return m > 0 ? `${m}分${sec < 10 ? "0" : ""}${sec}秒` : `${sec}秒`;
+}
+
+/**
+ * Params for the core `dashboard` tool. Third-party plugins cannot call
+ * `runtime.gateway.request` (trusted/bundled only), and an HTML widget would
+ * load from a loopback-only sandbox origin. `session:report` is drawn by the
+ * Control UI itself, so remote clients never touch that port.
+ */
+function statusCardParams(run: RunSnapshotLike) {
+  return {
+    action: "widget_put" as const,
+    pluginKind: "session:report" as const,
+    name: `zcode-workflow-status-${run.id}`,
+    title: `Workflow: ${run.name}`.slice(0, 80),
+    props: buildReportBlocks(run),
+    size: "md" as const,
+  };
+}
+
+function statusCardText(run: RunSnapshotLike): string {
+  const dashboardParams = statusCardParams(run);
+  return [
+    `Call the core dashboard tool NOW with exactly these parameters. It mounts a native session:report card (no iframe, no sandbox port) named ${dashboardParams.name}. Reuse the same name to refresh it.`,
+    "",
+    "```json",
+    JSON.stringify(dashboardParams, null, 2),
+    "```",
+  ].join("\n");
 }
 
 function planText(meta: RunMeta, notes: string[]): string {
@@ -206,7 +323,7 @@ export function buildToolDefs(): ToolDef[] {
             `Run started: ${meta.id} ("${meta.name}").`,
             `Script: ${plan.draftPath}`,
             `Wait for it with workflow_wait { run_id: "${meta.id}" }; snapshot anytime with workflow_get. Do not poll in a loop.`,
-            `Before waiting: call workflow_dashboard { run_id: "${meta.id}" } and immediately show_widget with its returned params (pin: true) so the user watches the live status panel.`,
+            `Before waiting: call workflow_dashboard { run_id: "${meta.id}" } and immediately pass its JSON to the core dashboard tool (widget_put, pluginKind session:report). Do not use show_widget or dashboard.html.`, 
           ].join("\n"),
           { runId: meta.id },
         );
@@ -282,7 +399,7 @@ export function buildToolDefs(): ToolDef[] {
   tool({
     name: "workflow_wait",
     label: "Wait for Workflow",
-    description: "Block until a run this session started settles (completed/errored/stopped/waiting_hole/waiting_question), or the timeout passes. Returns the final result and reported items.",
+    description: "Block until a run this session started settles (completed/errored/stopped/waiting_hole/waiting_question), or the timeout passes. Returns the final result and reported items. When it returns, call workflow_dashboard and apply its dashboard params to refresh the native status card.",
     parameters: Type.Object({
       run_id: Type.String({ description: "Run id from workflow_create." }),
       timeout_ms: Type.Optional(Type.Number({ description: "Wait budget in ms; default 300000, max 1800000." })),
@@ -297,10 +414,18 @@ export function buildToolDefs(): ToolDef[] {
         const meta = await loadRun(store, runId);
         if (TERMINAL_STATES.has(meta.state)) {
           const journal = await Journal.open(path.join(store.runDir(runId), "journal.jsonl"));
-          return text(settleText(meta, journal.reportedItems().length));
+          return text(
+            [
+              settleText(meta, journal.reportedItems().length),
+              "",
+              `Refresh the native status card with workflow_dashboard { run_id: "${runId}" }, then call dashboard with the returned params.`,
+            ].join("\n"),
+          );
         }
         if (Date.now() >= deadline) {
-          return text(`Run ${runId} is still ${meta.state} after ${timeoutMs}ms. Call workflow_wait again later or workflow_get for a snapshot. If no status panel is mounted yet, call workflow_dashboard { run_id: "${runId}" } and show_widget its params.`);
+          return text(
+            `Run ${runId} is still ${meta.state} after ${timeoutMs}ms. Call workflow_wait again later, or workflow_dashboard { run_id: "${runId}" } and apply its dashboard params to refresh the native card.`,
+          );
         }
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
@@ -692,12 +817,12 @@ export function buildToolDefs(): ToolDef[] {
     },
   });
 
-  // ---- workflow_dashboard ----
+  // ---- workflow_dashboard (native session:report card, no HTML) ----
   tool({
     name: "workflow_dashboard",
     label: "Workflow Status Dashboard",
     description:
-      "Return the ready-to-use show_widget parameters that mount the LIVE status panel for a workflow run on the session dashboard (phases timeline, ask/report counters, recent logs, waiting-hole and escalation banners). Call it right after workflow_create confirm starts a run, then call show_widget exactly with the returned params and pin: true. The widget self-refreshes via the zcode-workflow.runs dashboard binding.",
+      "Return core dashboard widget_put parameters for a native session:report status card (no iframe, no sandbox port): state, elapsed time, phase table, ask/report counters, recent logs, hole/question banners, final conclusion. Call it right after workflow_create confirm, then call the dashboard tool with the returned JSON in the same turn. Reuse the same widget name to refresh. Do not use show_widget or dashboard.html.",
     parameters: Type.Object({
       run_id: Type.Optional(Type.String({ description: "Run id; omitted = the most recent run in this workspace." })),
     }),
@@ -711,32 +836,11 @@ export function buildToolDefs(): ToolDef[] {
         runId = runs[0]!.id;
       }
       const meta = await loadRun(store, runId);
-      const templatePath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "skills", "workflow", "dashboard.html");
-      let template: string;
-      try {
-        template = await fs.readFile(templatePath, "utf8");
-      } catch {
-        return failure(`Dashboard template missing at ${templatePath}.`);
-      }
-      const widgetCode = template.split("__RUN_ID__").join(runId);
-      const widgetParams = {
-        title: `Workflow: ${meta.name}`,
-        name: `zcode-workflow-${runId}`,
-        pin: true,
-        size: "md",
-        capabilities: { tools: ["zcode-workflow.runs"] },
-        widget_code: widgetCode,
-      };
-      const lines = [
-        `Call show_widget now with EXACTLY these parameters (JSON, pin: true mounts it on the session dashboard and the panel then self-refreshes every 2.5s):`,
-        "",
-        "```json",
-        JSON.stringify(widgetParams, null, 2),
-        "```",
-        "",
-        `Binding grant: zcode-workflow.runs (reads live state of run ${runId} — state, phase timeline, asks/reports counters, logs, hole/question banners).`,
-      ];
-      return text(lines.join("\n"), { runId, widgetParams });
+      const { snapshotRun } = await import("./engine/dashboard.js");
+      const run = await snapshotRun(workspaceDir, meta.id);
+      if (!run) return failure(`No snapshot for run ${meta.id}.`);
+      const dashboardParams = statusCardParams(run);
+      return text(statusCardText(run), { dashboardParams });
     },
   });
 

@@ -130,6 +130,8 @@ export async function readRunSnapshot(workspaceDir: string, runId: string): Prom
   };
 }
 
+export const snapshotRun = readRunSnapshot;
+
 export async function listRunSummaries(workspaceDir: string, limit = 10): Promise<RunsSummary[]> {
   const store = new RunStore(workspaceDir);
   const metas = (await store.listRuns()).slice(0, limit);
