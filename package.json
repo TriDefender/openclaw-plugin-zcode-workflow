@@ -8,7 +8,8 @@
     "dist",
     "skills",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -35,7 +36,14 @@
     },
     "build": {
       "openclawVersion": "2026.11.5"
-    }
+    },
+    "files": [
+      "dist",
+      "skills",
+      "openclaw.plugin.json",
+      "README.md",
+      "LICENSE"
+    ]
   },
   "license": "MIT"
 }

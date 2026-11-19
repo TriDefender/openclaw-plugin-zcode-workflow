@@ -3,3 +3,5 @@ dist/
 *.tgz
 test/tmp-workspace/
 .install.log
+package-lock.json
+reports/
