@@ -1313,6 +1313,11 @@ standing decision (2026-11-23) after the iframe path died behind tailscale serve
   no further turns from you, including after your turn ends and the run keeps
   going in the background. It also self-heals to the newest run when the id
   placeholder was not injected.
+- **Unattended run → native card + watcher.** The plugin cannot wake sessions or push cards itself (OpenClaw only lets bundled/trusted-official plugins call gateway methods like `board.widget.put` or `appendAgentMessage` — verified in 2026.11.5). The sanctioned bridge is an agent-owned automation: call
+  `workflow_dashboard { run_id, watch: true, watchMinutes?: 5 }` and apply BOTH results — the
+  `widget_put` JSON to the core `dashboard` tool, and the returned `{action:"add", job:{...}}` to the
+  core `automations` tool. The watcher wakes this session on cadence, re-pushes the card, reports
+  once on settle and removes itself. Cadence is a cost knob: each wake is one agent turn.
 - **Default on every surface → the native card.**
   `workflow_dashboard { run_id }` returns the exact core `dashboard` parameters:
   `action: "widget_put"`, `pluginKind: "session:report"`, stable `name`

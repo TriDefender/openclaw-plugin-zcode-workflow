@@ -268,7 +268,7 @@ export function buildToolDefs(): ToolDef[] {
             `Run started: ${meta.id} ("${meta.name}").`,
             `Script: ${plan.draftPath}`,
             `Wait for it with workflow_wait { run_id: "${meta.id}" }; snapshot anytime with workflow_get. Do not poll in a loop.`,
-            `Before waiting, mount a status card: call workflow_dashboard { run_id: "${meta.id}" } and immediately pass its JSON to the core dashboard tool (widget_put, pluginKind session:report — refresh it by re-applying after each workflow_wait). Default to the native card: live:true renders an HTML panel in the mcp-app-sandbox iframe on sandboxPort, which remote/reverse-proxied browsers usually cannot reach (ERR_CONNECTION_REFUSED); use live:true only when the sandbox port is known reachable.`, 
+            `Before waiting, mount a status card: call workflow_dashboard { run_id: "${meta.id}" } and immediately pass its JSON to the core dashboard tool (widget_put, pluginKind session:report — refresh it by re-applying after each workflow_wait). For an unattended background run, call it with watch: true instead and also apply the returned automations add params so a watcher refreshes the card for you. Default to the native card: live:true renders an HTML panel in the mcp-app-sandbox iframe on sandboxPort, which remote/reverse-proxied browsers usually cannot reach (ERR_CONNECTION_REFUSED); use live:true only when the sandbox port is known reachable.`, 
           ].join("\n"),
           { runId: meta.id },
         );
@@ -775,10 +775,12 @@ export function buildToolDefs(): ToolDef[] {
     name: "workflow_dashboard",
     label: "Workflow Status Dashboard",
     description:
-      "Status surface for a workflow run. Default: core dashboard widget_put parameters for a native session:report card — a static snapshot that updates only when you re-apply it (call the dashboard tool with the returned JSON in the same turn; reuse the same widget name). Use live: true on a Control UI session instead: it returns show_widget parameters for a self-refreshing panel (2.5s poll of the zcode-workflow.runs binding) that follows the background run with no further turns. CAUTION: the live panel renders inside the mcp-app-sandbox iframe on sandboxPort; when the viewer's browser cannot reach that port (tailscale serve / reverse proxies usually forward only the main gateway port), the frame stays dead with ERR_CONNECTION_REFUSED — prefer the default native card there. The live path also needs show_widget plus the binding grant; chat-only surfaces should use the default card.",
+      "Status surface for a workflow run. Default: core dashboard widget_put parameters for a native session:report card — a static snapshot that updates only when you re-apply it (call the dashboard tool with the returned JSON in the same turn; reuse the same widget name). Use live: true on a Control UI session instead: it returns show_widget parameters for a self-refreshing panel (2.5s poll of the zcode-workflow.runs binding) that follows the background run with no further turns. CAUTION: the live panel renders inside the mcp-app-sandbox iframe on sandboxPort; when the viewer's browser cannot reach that port (tailscale serve / reverse proxies usually forward only the main gateway port), the frame stays dead with ERR_CONNECTION_REFUSED — prefer the default native card there. The live path also needs show_widget plus the binding grant; chat-only surfaces should use the default card. For an unattended background run on the native card, pass watch: true: the text then also contains ready-to-apply automations add parameters for a recurring session watcher that re-pushes the card until the run settles (the plugin itself cannot wake sessions or push cards — OpenClaw only lets bundled/trusted-official plugins do that; the agent-owned watcher is the sanctioned bridge).",
     parameters: Type.Object({
       run_id: Type.Optional(Type.String({ description: "Run id; omitted = the most recent run in this workspace." })),
       live: Type.Optional(Type.Boolean({ description: "true: return show_widget params for the self-refreshing Control UI panel instead of the static session:report card." })),
+      watch: Type.Optional(Type.Boolean({ description: "true (native card): also return ready-to-apply automations add parameters for a recurring watcher that wakes this session to re-push the card until the run settles." })),
+      watchMinutes: Type.Optional(Type.Number({ description: "Watcher cadence in minutes for watch:true (default 5, clamped 2-60)." })),
     }),
     handler: async (params, ctx) => {
       const workspaceDir = workspaceOf(ctx);
@@ -820,6 +822,35 @@ export function buildToolDefs(): ToolDef[] {
       const run = await snapshotRun(workspaceDir, meta.id);
       if (!run) return failure(`No snapshot for run ${meta.id}.`);
       const dashboardParams = statusCardParams(run);
+      if (params.watch === true) {
+        const minutes = Math.max(2, Math.min(60, Math.round(Number(params.watchMinutes ?? 5))));
+        const jobName = `zcode-workflow-watch-${runId}`.slice(0, 80);
+        const watchMessage = [
+          `[zcode-workflow watch] run ${runId}（${meta.name}）定时检查：`,
+          `1) workflow_get {run_id:"${runId}"} 取快照；`,
+          `2) workflow_dashboard {run_id:"${runId}"}，把返回 text 里第一个 \`\`\`json 块原样传给 dashboard 工具（widget_put，同名卡片刷新）；`,
+          `3) state 为 completed/errored/stopped：刷新终态卡片后用一句话向用户报告结论或错误，然后 automations {action:"remove", jobId:"本任务id"}（先 automations {action:"list"} 找到 id）；`,
+          `4) state 为 waiting_hole/waiting_question：一句话说明待填/待答项；`,
+          `5) 仍在 running：阶段有进展只回一行进度，无进展只回复 …。`,
+        ].join("\n");
+        const watchJob = {
+          name: jobName,
+          description: `Refresh the workflow status card for run ${runId} every ${minutes} min until it settles, then report and self-remove.`,
+          schedule: { kind: "every", everyMs: minutes * 60_000 },
+          sessionTarget: "current",
+          payload: { kind: "agentTurn", message: watchMessage },
+          deleteAfterRun: false,
+        };
+        const lines = [
+          statusCardText(run),
+          "",
+          `Then mount the watcher with ONE automations call — pass this whole object to automations as {action:"add"} (it wakes this session every ${minutes} min to re-push the card; the watcher removes itself on settle):`,
+          "```json",
+          JSON.stringify({ action: "add", job: watchJob }, null, 2),
+          "```",
+        ];
+        return text(lines.join("\n"), { dashboardParams, watchJob });
+      }
       return text(statusCardText(run), { dashboardParams });
     },
   });
