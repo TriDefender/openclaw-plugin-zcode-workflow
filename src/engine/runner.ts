@@ -13,7 +13,7 @@ import fs from "node:fs/promises";
 import { compileWorkflow } from "./compile.js";
 import { Journal, stableKey } from "./journal.js";
 import { RunStore } from "./store.js";
-import { Semaphore, SubagentPool, type SubagentRuntime } from "./agents.js";
+import { Semaphore, SubagentPool, type SubagentRuntime, type TaskDoneInfo } from "./agents.js";
 import { resolveAskConcurrency } from "./scope.js";
 import { ArtifactPublisher } from "./artifacts.js";
 import { extractJson, validateAgainstSchema } from "./schema.js";
@@ -101,8 +101,31 @@ function sha256(text: string): string {
   return crypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
+/** Captured origin-session target for session-event notifications (in-memory only: the
+ *  handle contains function-valued authority fields and cannot be persisted; after a
+ *  gateway restart a matching session can re-capture it via workflow_resume/amend). */
+export interface NotifyTarget {
+  agentId: string;
+  sessionKey: string;
+  expectedTarget?: unknown;
+}
+
+/** Minimal slice of api.runtime.system used for push notifications. */
+export interface NotifySystem {
+  enqueueSessionEvent?: (
+    text: string,
+    opts: { agentId: string; sessionKey: string; expectedTarget?: unknown },
+  ) => {
+    accepted: Promise<{ ok: boolean; error?: string }>;
+    settled: Promise<{ status: string; error?: string }>;
+    cancel: () => void;
+  };
+}
+
 export class WorkflowRunner {
   private live = new Map<string, { abort: (reason: "user" | "model") => void; settle: () => void }>();
+  private notifyTargets = new Map<string, NotifyTarget>();
+  private notifyBuffers = new Map<string, { lines: string[]; timer: ReturnType<typeof setTimeout> | undefined }>();
 
   constructor(
     private readonly store: RunStore,
@@ -118,7 +141,18 @@ export class WorkflowRunner {
      * with 'agent tool caller authority is no longer active'.
      */
     private readonly runInBackground: (run: () => Promise<void>) => Promise<void> = (run) => run(),
+    /** api.runtime.system slice — enables per-task session-event notifications. */
+    private readonly notifySystem?: NotifySystem,
   ) {}
+
+  /** Register the originating session as the notify target for a run. */
+  rememberNotifyTarget(runId: string, target: NotifyTarget): void {
+    this.notifyTargets.set(runId, target);
+  }
+
+  notifyTargetFor(runId: string): NotifyTarget | undefined {
+    return this.notifyTargets.get(runId);
+  }
 
   private poolFor(meta: RunMeta): SubagentPool {
     const agentId = meta.agentId;
@@ -126,11 +160,100 @@ export class WorkflowRunner {
       throw new WorkflowError(`run ${meta.id} has no owning agent`, "no_agent");
     }
     const limit = resolveAskConcurrency(this.readConfig(), agentId, meta.maxConcurrency);
-    return new SubagentPool(this.subagents, meta.id, agentId, this.workspaceDir, meta.subagentModel, new Semaphore(limit), this.logger);
+    return new SubagentPool(
+      this.subagents,
+      meta.id,
+      agentId,
+      this.workspaceDir,
+      meta.subagentModel,
+      new Semaphore(limit),
+      this.logger,
+      (info) => this.onTaskDone(meta, info),
+    );
   }
 
   isLive(runId: string): boolean {
     return this.live.has(runId);
+  }
+
+  // ---- session-event notifications (per-task + settle pushes) ----
+
+  private static readonly NOTIFY_FLUSH_MS = 1_500;
+
+  private onTaskDone(meta: RunMeta, info: TaskDoneInfo): void {
+    if (!this.notifyTargets.has(meta.id) || !this.notifySystem?.enqueueSessionEvent) return;
+    const label = info.name ?? `#${info.ordinal}`;
+    const summary = (info.summary ?? "").trim().replace(/\s+/g, " ").slice(0, 160);
+    const line = info.ok
+      ? `任务 ${label} 完成${summary ? `：${summary}` : ""}`
+      : `任务 ${label} 失败：${summary || "unknown error"}`;
+    let buffer = this.notifyBuffers.get(meta.id);
+    if (!buffer) {
+      buffer = { lines: [], timer: undefined };
+      this.notifyBuffers.set(meta.id, buffer);
+    }
+    buffer.lines.push(line);
+    if (buffer.timer) clearTimeout(buffer.timer);
+    buffer.timer = setTimeout(() => void this.flushNotify(meta), WorkflowRunner.NOTIFY_FLUSH_MS);
+    // Never let a pending timer keep the process alive or the run unsettled.
+    buffer.timer.unref?.();
+  }
+
+  private flushNotify(meta: RunMeta): void {
+    const buffer = this.notifyBuffers.get(meta.id);
+    if (!buffer || buffer.lines.length === 0) return;
+    const lines = buffer.lines.splice(0, buffer.lines.length);
+    if (buffer.timer) {
+      clearTimeout(buffer.timer);
+      buffer.timer = undefined;
+    }
+    const body = lines.map((l) => `- ${l}`).join("\n");
+    const text = [
+      `[zcode-workflow] run ${meta.id}（${meta.name}）进度：`,
+      body,
+      `请刷新状态卡：workflow_dashboard {run_id:"${meta.id}"} 并把返回 JSON 传给 dashboard 工具（同名刷新）；回复不超过一行。`,
+    ].join("\n");
+    this.enqueueNotify(meta, text);
+  }
+
+  private notifySettled(meta: RunMeta, detail: string): void {
+    if (!this.notifyTargets.has(meta.id) || !this.notifySystem?.enqueueSessionEvent) return;
+    // Flush any pending task lines first so ordering stays natural.
+    this.flushNotify(meta);
+    const stateLabel: Record<string, string> = {
+      completed: "已完成",
+      errored: "已出错",
+      stopped: "已停止",
+      waiting_hole: "等待填洞",
+      waiting_question: "等待回答问题",
+    };
+    const text = [
+      `[zcode-workflow] run ${meta.id}（${meta.name}）${stateLabel[meta.state] ?? meta.state}。${detail}`.trim(),
+      `请刷新终态卡：workflow_dashboard {run_id:"${meta.id}"} → dashboard（同名刷新）；回复不超过一行。`,
+    ].join("\n");
+    this.enqueueNotify(meta, text);
+  }
+
+  private enqueueNotify(meta: RunMeta, text: string): void {
+    const target = this.notifyTargets.get(meta.id);
+    const enqueue = this.notifySystem?.enqueueSessionEvent;
+    if (!target || !enqueue) return;
+    try {
+      const receipt = enqueue(text, {
+        agentId: target.agentId,
+        sessionKey: target.sessionKey,
+        ...(target.expectedTarget !== undefined ? { expectedTarget: target.expectedTarget } : {}),
+      });
+      void receipt.accepted
+        .then((admission) => {
+          if (admission.ok) this.logger.info(`workflow run ${meta.id}: session event admitted to ${target.sessionKey}`);
+          else this.logger.warn(`workflow run ${meta.id}: session event rejected (${admission.error ?? "unknown"})`);
+        })
+        .catch((err) => this.logger.warn(`workflow run ${meta.id}: session event admission failed: ${(err as Error).message}`));
+      void receipt.settled.catch(() => {});
+    } catch (err) {
+      this.logger.warn(`workflow run ${meta.id}: session event enqueue failed: ${(err as Error).message}`);
+    }
   }
 
   liveIds(): string[] {
@@ -556,6 +679,15 @@ export class WorkflowRunner {
       await journal.append({ kind: "status", state: "completed" });
       await this.store.saveMeta(meta);
       this.logger.info(`workflow run ${meta.id} ("${meta.name}") completed`);
+      const resultText = (() => {
+        try {
+          const s = JSON.stringify(meta.result);
+          return s ? `结果：${s.slice(0, 200)}` : "";
+        } catch {
+          return "";
+        }
+      })();
+      this.notifySettled(meta, resultText);
       return;
     }
 
@@ -565,6 +697,7 @@ export class WorkflowRunner {
       await journal.append({ kind: "status", state: "waiting_hole", detail: err.holeName });
       await this.store.saveMeta(meta);
       this.logger.info(`workflow run ${meta.id} waiting at hole "${err.holeName}"`);
+      this.notifySettled(meta, `等待填洞 ${err.holeName}（workflow_fill_hole）。`);
       return;
     }
     if (err instanceof EscalationSignal) {
@@ -573,6 +706,7 @@ export class WorkflowRunner {
       await journal.append({ kind: "status", state: "waiting_question", detail: err.question.id });
       await this.store.saveMeta(meta);
       this.logger.warn(`workflow run ${meta.id}: subagent "${err.question.agentName ?? "anonymous"}" escalated a question`);
+      this.notifySettled(meta, `子代理 ${err.question.agentName ?? "anonymous"} 提出了问题（workflow_resolve_question）。`);
       return;
     }
     if (err instanceof StopSignal) {
@@ -581,6 +715,7 @@ export class WorkflowRunner {
       await journal.append({ kind: "status", state: "stopped", detail: err.reason });
       await this.store.saveMeta(meta);
       this.logger.info(`workflow run ${meta.id} stopped (${err.reason})`);
+      this.notifySettled(meta, `停止原因：${err.reason}。`);
       return;
     }
     meta.state = "errored";
@@ -589,6 +724,7 @@ export class WorkflowRunner {
     await journal.append({ kind: "status", state: "errored", detail: meta.error });
     await this.store.saveMeta(meta);
     this.logger.error(`workflow run ${meta.id} errored: ${meta.error}`);
+    this.notifySettled(meta, `错误：${meta.error.slice(0, 200)}`);
   }
 
   // ---- snippet evaluation (synchronous, nothing persisted) ----

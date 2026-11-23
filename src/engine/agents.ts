@@ -51,6 +51,14 @@ export interface Persona {
 
 const ASK_WAIT_CHUNK_MS = 60_000;
 
+/** One ask() resolution, reported to the run for session-event notification. */
+export interface TaskDoneInfo {
+  name: string | undefined;
+  ordinal: number;
+  ok: boolean;
+  summary: string;
+}
+
 export interface PoolLogger {
   warn(message: string): void;
 }
@@ -75,6 +83,8 @@ export class SubagentPool {
     private readonly defaultModel: string | undefined,
     private readonly semaphore: Semaphore,
     private readonly logger?: PoolLogger,
+    /** Invoked once per ask() resolution so the run can push session events. */
+    private readonly onTaskDone?: (info: TaskDoneInfo) => void,
   ) {}
 
   /** Runtime identity check: a computed duplicate name fails the run. */
@@ -147,15 +157,23 @@ export class SubagentPool {
       while (Date.now() < deadline) {
         const wait = await this.runtime.waitForRun({ runId: subRunId, timeoutMs: ASK_WAIT_CHUNK_MS });
         if (wait.status === "ok") {
+          let reply: string;
           if (wait.terminalReply && wait.terminalReply.disposition === "visible") {
-            return wait.terminalReply.text;
+            reply = wait.terminalReply.text;
+          } else {
+            reply = await this.lastAssistantText(sessionKey);
           }
-          return this.lastAssistantText(sessionKey);
+          this.onTaskDone?.({ name, ordinal, ok: true, summary: reply });
+          return reply;
         }
         if (wait.status === "pending" || wait.status === "timeout") continue;
-        throw new AskError(`subagent ${name ?? "(anonymous)"} failed: ${wait.error ?? wait.stopReason ?? "unknown error"}`);
+        const fail = new AskError(`subagent ${name ?? "(anonymous)"} failed: ${wait.error ?? wait.stopReason ?? "unknown error"}`);
+        this.onTaskDone?.({ name, ordinal, ok: false, summary: fail.message });
+        throw fail;
       }
-      throw new AskError(`subagent ${name ?? "(anonymous)"} exceeded the 24h ask deadline`);
+      const deadlineFail = new AskError(`subagent ${name ?? "(anonymous)"} exceeded the 24h ask deadline`);
+      this.onTaskDone?.({ name, ordinal, ok: false, summary: deadlineFail.message });
+      throw deadlineFail;
     } finally {
       release();
     }

@@ -129,6 +129,8 @@ export interface RunMeta {
   fills: Record<string, string>;
   /** Saved-workflow provenance, when started from a saved definition. */
   savedFrom?: { name: string; args?: Record<string, unknown> };
+  /** Session-event notifications: push task/settle events to the originating session. */
+  notify?: { sessionKey: string };
   /** Evaluation-only runs (EvalWorkflowSnippet) never appear here. */
 }
 

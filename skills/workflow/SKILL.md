@@ -1313,6 +1313,14 @@ standing decision (2026-11-23) after the iframe path died behind tailscale serve
   no further turns from you, including after your turn ends and the run keeps
   going in the background. It also self-heals to the newest run when the id
   placeholder was not injected.
+- **Event-driven push → `notify: true`.** `workflow_create { ..., notify: true }` captures the
+  originating session at tool-call time (`api.runtime.system.captureSessionEventTarget`) and the
+  runner then pushes each completed subagent task (coalesced over ~1.5s) and the final state back
+  into that session (`api.runtime.system.enqueueSessionEvent` — the sanctioned plugin→session push
+  path; no bundled/trusted gate, unlike gateway.request / appendAgentMessage). Each push wakes the
+  session: refresh the card, reply ≤1 line. Cost: one turn per event batch (watcher = one per
+  cadence). The in-memory target handle dies with a gateway restart: workflow_resume / workflow_amend
+  from the same session re-arms it automatically; other sessions cannot hijack the binding.
 - **Unattended run → native card + watcher.** The plugin cannot wake sessions or push cards itself (OpenClaw only lets bundled/trusted-official plugins call gateway methods like `board.widget.put` or `appendAgentMessage` — verified in 2026.11.5). The sanctioned bridge is an agent-owned automation: call
   `workflow_dashboard { run_id, watch: true, watchMinutes?: 5 }` and apply BOTH results — the
   `widget_put` JSON to the core `dashboard` tool, and the returned `{action:"add", job:{...}}` to the

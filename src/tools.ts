@@ -35,6 +35,23 @@ export interface ToolHostApi {
    * dispatches survive the end of the turn that started them.
    */
   lifecycle?: { runInBackgroundContext?: <T>(run: () => T) => T };
+  /**
+   * api.runtime.system slice: session-event notification. captureSessionEventTarget
+   * binds the originating session at tool-call time; enqueueSessionEvent later admits
+   * immediate work into that session (the sanctioned plugin push path — no trust gate,
+   * unlike gateway.request/appendAgentMessage which require bundled/trusted-official).
+   */
+  system?: {
+    captureSessionEventTarget?: (agentId: string, sessionKey: string) => Promise<unknown>;
+    enqueueSessionEvent?: (
+      text: string,
+      opts: { agentId: string; sessionKey: string; expectedTarget?: unknown },
+    ) => {
+      accepted: Promise<{ ok: boolean; error?: string }>;
+      settled: Promise<{ status: string; error?: string }>;
+      cancel: () => void;
+    };
+  };
 }
 
 export interface ToolContext {
@@ -89,6 +106,30 @@ function stampAgent(meta: RunMeta, ctx: ToolContext): void {
   if (!meta.agentId) meta.agentId = owningAgentId(ctx);
 }
 
+/**
+ * Capture the origin-session event target while this tool call still holds the
+ * session's authority, so the background run can push task/settle events back
+ * into that session (api.runtime.system.enqueueSessionEvent — the sanctioned
+ * plugin push path). Only binds when the run's notify session matches the
+ * calling session; never hijacks another session's binding.
+ */
+async function armSessionNotify(ctx: ToolContext, runner: WorkflowRunner, meta: RunMeta): Promise<boolean> {
+  const notifyKey = meta.notify?.sessionKey;
+  const sessionKey = ctx.session?.sessionKey;
+  const system = (ctx.api as ToolHostApi).system;
+  if (!sessionKey || !notifyKey || notifyKey !== sessionKey) return false;
+  if (!system?.captureSessionEventTarget || !system.enqueueSessionEvent) return false;
+  const agentId = meta.agentId ?? owningAgentId(ctx);
+  try {
+    const expectedTarget = await system.captureSessionEventTarget(agentId, sessionKey);
+    runner.rememberNotifyTarget(meta.id, { agentId, sessionKey, expectedTarget });
+    return true;
+  } catch (err) {
+    ctx.api.logger.warn(`workflow run ${meta.id}: session notify capture failed: ${(err as Error).message}`);
+    return false;
+  }
+}
+
 function workspaceOf(ctx: ToolContext): string {
   const fromTurn = ctx.session?.workspaceDir?.trim();
   if (fromTurn) return fromTurn;
@@ -109,6 +150,7 @@ function runnerOf(ctx: ToolContext, workspaceDir: string): WorkflowRunner {
       ctx.api.logger,
       () => ctx.api.runtime.config.current(),
       ctx.background,
+      (ctx.api as ToolHostApi).system,
     );
     ctx.runners.set(workspaceDir, runner);
   }
@@ -226,6 +268,7 @@ export function buildToolDefs(): ToolDef[] {
       token: Type.Optional(Type.String({ description: "The plan token from the previous call." })),
       max_concurrency: Type.Optional(Type.Number({ description: "Upper bound on concurrent subagent asks. Omit to use the configured OpenClaw subagent lane (maxConcurrent and maxChildrenPerAgent). A number cannot exceed that lane." })),
       subagent_model: Type.Optional(Type.String({ description: "providerId/modelId or bare model id for subagents. Set only when the user asks." })),
+      notify: Type.Optional(Type.Boolean({ description: "true: push task/settle events back to the originating session via session events — each completed subagent task (and the final state) wakes that session to refresh the status card. Default off." })),
     }),
     handler: async (params, ctx) => {
       const workspaceDir = workspaceOf(ctx);
@@ -260,13 +303,25 @@ export function buildToolDefs(): ToolDef[] {
           fills: {},
           savedFrom: plan.savedFrom,
         };
+        if (params.notify === true) {
+          if (ctx.session?.sessionKey) {
+            meta.notify = { sessionKey: ctx.session.sessionKey };
+          } else {
+            ctx.api.logger.warn("workflow_create notify:true but the calling session key is unavailable; notifications disabled for this run.");
+          }
+        }
+        await armSessionNotify(ctx, runnerOf(ctx, workspaceDir), meta);
         await store.saveMeta(meta);
         await store.writeScript(meta.id, plan.source);
         runnerOf(ctx, workspaceDir).start(meta);
+        const notifyArmed = runnerOf(ctx, workspaceDir).notifyTargetFor(meta.id) !== undefined;
         return text(
           [
             `Run started: ${meta.id} ("${meta.name}").`,
             `Script: ${plan.draftPath}`,
+            notifyArmed
+              ? `Session notify: armed — each completed task and the final state will wake this session to refresh the card.`
+              : undefined,
             `Wait for it with workflow_wait { run_id: "${meta.id}" }; snapshot anytime with workflow_get. Do not poll in a loop.`,
             `Before waiting, mount a status card: call workflow_dashboard { run_id: "${meta.id}" } and immediately pass its JSON to the core dashboard tool (widget_put, pluginKind session:report — refresh it by re-applying after each workflow_wait). For an unattended background run, call it with watch: true instead and also apply the returned automations add params so a watcher refreshes the card for you. Default to the native card: live:true renders an HTML panel in the mcp-app-sandbox iframe on sandboxPort, which remote/reverse-proxied browsers usually cannot reach (ERR_CONNECTION_REFUSED); use live:true only when the sandbox port is known reachable.`, 
           ].join("\n"),
@@ -531,6 +586,7 @@ export function buildToolDefs(): ToolDef[] {
         savedFrom: old.savedFrom,
       };
       stampAgent(meta, ctx);
+      await armSessionNotify(ctx, runner, meta);
 
       // stop the predecessor if it is live
       runner.stop(old.id, "model");
@@ -577,6 +633,7 @@ export function buildToolDefs(): ToolDef[] {
       if (meta.state === "waiting_question") return failure(`Run ${meta.id} is waiting on ${meta.pendingQuestions.length} question(s); answer with workflow_resolve_question.`);
       if (meta.state === "superseded") return failure(`Run ${meta.id} was superseded.`);
       stampAgent(meta, ctx);
+      await armSessionNotify(ctx, runner, meta);
       meta.state = "running";
       meta.updatedAt = new Date().toISOString();
       await store.saveMeta(meta);

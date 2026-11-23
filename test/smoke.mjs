@@ -10,6 +10,7 @@ import os from "node:os";
 import { compileWorkflow } from "../dist/engine/compile.js";
 import { createTools } from "../dist/tools.js";
 import { WorkflowRunner } from "../dist/engine/runner.js";
+import { SubagentPool } from "../dist/engine/agents.js";
 import { RunStore } from "../dist/engine/store.js";
 import { Journal } from "../dist/engine/journal.js";
 
@@ -361,6 +362,85 @@ async function waitSettled(store, runId, timeoutMs = 30_000) {
   assert.equal(card.details.dashboardParams.pluginKind, "session:report");
 
   await fs.rm(dir, { recursive: true, force: true });
+}
+
+// ---------- session-event notify: per-task callback + coalesced/settle pushes ----------
+{
+  // a. SubagentPool reports ask resolutions through onTaskDone (success + failure)
+  {
+    const events = [];
+    const subs = {
+      async run(p) { return { runId: "n-" + (p.message.includes("炸") ? "bad" : "good") }; },
+      async waitForRun({ runId }) {
+        if (runId === "n-bad") return { status: "error", error: "boom" };
+        return { status: "ok", terminalReply: { disposition: "visible", text: "任务回复" } };
+      },
+    };
+    const pool = new SubagentPool(
+      subs, "notify-run", "main", undefined, undefined,
+      { acquire: async () => () => {} }, undefined,
+      (info) => events.push(info),
+    );
+    const reply = await pool.ask("worker", 0, undefined, "干一件事");
+    assert.equal(reply, "任务回复");
+    assert.equal(events.length, 1);
+    assert.equal(events[0].ok, true);
+    assert.equal(events[0].name, "worker");
+    await assert.rejects(() => pool.ask("bomber", 1, undefined, "炸一下"));
+    assert.equal(events.length, 2);
+    assert.equal(events[1].ok, false);
+    assert.ok(events[1].summary.includes("boom"), "failure summary surfaced");
+  }
+
+  // b. Runner coalesces task lines and pushes settle to the notify target
+  {
+    const pushes = [];
+    const system = {
+      enqueueSessionEvent(text, opts) {
+        pushes.push({ text, opts });
+        return { accepted: Promise.resolve({ ok: true }), settled: Promise.resolve({ status: "completed" }), cancel: () => {} };
+      },
+    };
+    const store = new RunStore(workspace);
+    const runner = new WorkflowRunner(store, fakeSubs(), workspace, quietLogger(), () => ({}), (r) => r(), system);
+    const script = `
+phase("a");
+const x = await agent("甲").ask<string>("说一句话");
+const y = await agent("乙").ask<string>("说一句话");
+return { x, y };
+`;
+    const meta = newMeta(store, "notify-run");
+    runner.rememberNotifyTarget(meta.id, { agentId: "main", sessionKey: "agent:main:main:webchat", expectedTarget: { gen: 7 } });
+    await store.saveMeta(meta);
+    await store.writeScript(meta.id, script);
+    runner.start(meta);
+    await waitSettled(store, meta.id);
+    const m = await store.loadMeta(meta.id);
+    assert.equal(m.state, "completed", "notify run completed: " + m.error);
+    const allText = pushes.map((p) => p.text).join("\n");
+    assert.ok(allText.includes("任务 甲 完成"), "task 甲 line delivered");
+    assert.ok(allText.includes("任务 乙 完成"), "task 乙 line delivered");
+    assert.ok(allText.includes("已完成"), "settle push delivered");
+    assert.ok(allText.includes("workflow_dashboard {run_id:"), "card refresh hint present");
+    assert.ok(pushes.length >= 2, "progress + settle pushes: " + pushes.length);
+    assert.equal(pushes.at(-1).opts.sessionKey, "agent:main:main:webchat");
+    assert.deepEqual(pushes.at(-1).opts.expectedTarget, { gen: 7 });
+  }
+
+  // c. Notify failures never break the run
+  {
+    const store = new RunStore(workspace);
+    const system = { enqueueSessionEvent() { throw new Error("admission down"); } };
+    const runner = new WorkflowRunner(store, fakeSubs(), workspace, quietLogger(), () => ({}), (r) => r(), system);
+    const meta = newMeta(store, "notify-fail");
+    runner.rememberNotifyTarget(meta.id, { agentId: "main", sessionKey: "agent:main:main:other" });
+    await store.saveMeta(meta);
+    await store.writeScript(meta.id, `phase("a");\nreturn 1;`);
+    runner.start(meta);
+    await waitSettled(store, meta.id);
+    const m = await store.loadMeta(meta.id);
+    assert.equal(m.state, "completed", "run survives notify failure: " + m.error);
+  }
 }
 
 console.log("smoke: all assertions passed");
