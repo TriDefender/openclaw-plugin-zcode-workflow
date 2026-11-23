@@ -26,6 +26,23 @@ export interface ToolHostApi {
     };
     config: { current(): unknown };
     subagent: SubagentRuntime;
+    /**
+     * api.runtime.system slice: session-event notification. captureSessionEventTarget
+     * binds the originating session at tool-call time; enqueueSessionEvent later admits
+     * immediate work into that session (the sanctioned plugin push path — no trust gate,
+     * unlike gateway.request/appendAgentMessage which require bundled/trusted-official).
+     */
+    system?: {
+      captureSessionEventTarget?: (agentId: string, sessionKey: string) => Promise<unknown>;
+      enqueueSessionEvent?: (
+        text: string,
+        opts: { agentId: string; sessionKey: string; expectedTarget?: unknown },
+      ) => {
+        accepted: Promise<{ ok: boolean; error?: string }>;
+        settled: Promise<{ status: string; error?: string }>;
+        cancel: () => void;
+      };
+    };
   };
   logger: RunnerLogger;
   /**
@@ -35,23 +52,6 @@ export interface ToolHostApi {
    * dispatches survive the end of the turn that started them.
    */
   lifecycle?: { runInBackgroundContext?: <T>(run: () => T) => T };
-  /**
-   * api.runtime.system slice: session-event notification. captureSessionEventTarget
-   * binds the originating session at tool-call time; enqueueSessionEvent later admits
-   * immediate work into that session (the sanctioned plugin push path — no trust gate,
-   * unlike gateway.request/appendAgentMessage which require bundled/trusted-official).
-   */
-  system?: {
-    captureSessionEventTarget?: (agentId: string, sessionKey: string) => Promise<unknown>;
-    enqueueSessionEvent?: (
-      text: string,
-      opts: { agentId: string; sessionKey: string; expectedTarget?: unknown },
-    ) => {
-      accepted: Promise<{ ok: boolean; error?: string }>;
-      settled: Promise<{ status: string; error?: string }>;
-      cancel: () => void;
-    };
-  };
 }
 
 export interface ToolContext {
@@ -116,7 +116,7 @@ function stampAgent(meta: RunMeta, ctx: ToolContext): void {
 async function armSessionNotify(ctx: ToolContext, runner: WorkflowRunner, meta: RunMeta): Promise<boolean> {
   const notifyKey = meta.notify?.sessionKey;
   const sessionKey = ctx.session?.sessionKey;
-  const system = (ctx.api as ToolHostApi).system;
+  const system = ctx.api.runtime.system;
   if (!sessionKey || !notifyKey || notifyKey !== sessionKey) return false;
   if (!system?.captureSessionEventTarget || !system.enqueueSessionEvent) return false;
   const agentId = meta.agentId ?? owningAgentId(ctx);
@@ -150,7 +150,7 @@ function runnerOf(ctx: ToolContext, workspaceDir: string): WorkflowRunner {
       ctx.api.logger,
       () => ctx.api.runtime.config.current(),
       ctx.background,
-      (ctx.api as ToolHostApi).system,
+      ctx.api.runtime.system,
     );
     ctx.runners.set(workspaceDir, runner);
   }

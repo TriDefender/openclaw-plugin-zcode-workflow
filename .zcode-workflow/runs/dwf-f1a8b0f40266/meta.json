@@ -1,0 +1,28 @@
+{
+  "id": "dwf-f1a8b0f40266",
+  "agentId": "coder",
+  "name": "notify-探针",
+  "state": "completed",
+  "createdAt": "2026-11-23T22:24:50.736Z",
+  "updatedAt": "2026-11-23T22:25:36.374Z",
+  "scriptPath": ".zcode-workflow/drafts/notify.1.ts",
+  "effectiveScriptHash": "c66967d16644ac34e4648be04d61059674d838f18d004b2049c5247a445bc3c4",
+  "phases": [
+    "探针"
+  ],
+  "commands": [],
+  "agentNames": [
+    "探针一",
+    "探针二"
+  ],
+  "holes": [],
+  "pendingQuestions": [],
+  "fills": {},
+  "notify": {
+    "sessionKey": "agent:coder:dashboard:c7a1d446-fd78-4ecf-b75b-b52ce14ba9d2"
+  },
+  "result": {
+    "r1": "任务一",
+    "r2": "任务二"
+  }
+}
