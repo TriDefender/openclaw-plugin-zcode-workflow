@@ -1,0 +1,5 @@
+{"kind":"status","state":"running","seq":1,"at":"2026-11-23T23:18:17.939Z"}
+{"kind":"phase","name":"探针","seq":2,"at":"2026-11-23T23:18:17.941Z"}
+{"kind":"status","state":"completed","seq":3,"at":"2026-11-23T23:18:17.942Z"}
+{"kind":"ask","agent":"探针一","agentIndex":0,"instructions":"回复三个字：任务一","result":"任务一","typed":false,"seq":4,"at":"2026-11-23T23:18:26.967Z"}
+{"kind":"ask","agent":"探针二","agentIndex":0,"instructions":"回复三个字：任务二","result":"任务二","typed":false,"seq":5,"at":"2026-11-23T23:18:30.015Z"}

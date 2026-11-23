@@ -25,3 +25,13 @@ Append structured entries:
 - Cause: live HTML 卡渲染在 mcp-app-sandbox iframe（sandboxPort 18790，仅 loopback）；本环境 Control UI 走外部 tailscale serve（gateway.tailscale.mode=off），只有 443/8443→18789 两条路由，18790 无路由
 - Facts: `tailscale serve --https=18790` 能注册声明（serve status 可见）但 tailscaled 从未监听 18790（netstat 无 LISTENING；443/8443 均正常监听，说明自定义端口本身可绑，原因未深查）
 - Decision: 用户重申 2026-11-19 的决策——原生 session:report 卡为默认，iframe+HTML 路线弃用；已撤 serve 规则并恢复原生卡。live:true 保留为沙箱可达环境的选择项
+
+## ERR-20261123-005 插件 API 路径写错一层导致静默无效（api.system vs api.runtime.system）
+- 现象: notify:true 装配成功（meta.json 有 sessionKey）、run 正常完成，但零推送；日志无任何 admit/reject/warn。
+- 根因: armSessionNotify 与 runnerOf 读 `(ctx.api as ToolHostApi).system`，真实切片在 `ctx.api.runtime.system`（core dist channel-*.mjs:901 可证）。undefined → 守卫静默早退。自己代码注释里明明写着 api.runtime.system。
+- 教训: 接线前用 core dist 里的真实访问路径做对照（grep 一行即可），不要凭注释/记忆拼 API 树；静默守卫要配合"启动消息回报 armed/unarmed"才可诊断。
+
+## ERR-20261123-006 语句式脚本顶层 return 不等待 ask()
+- 现象: `phase("x"); const r = agent("a").ask(...); return {r}` → run 3ms 即 completed，ask fire-and-forget 之后落地，结果序列化为 {}。
+- 根因: 顶层语句不隐式 await ask()；箭头函数体（phase 第二参在旧版可行）或显式 await 才会等待。
+- 教训: 探针/示例脚本一律显式 await ask()，或回到编译器接受的函数体形状；验证 run 结果非空才算 ask 真正执行。
