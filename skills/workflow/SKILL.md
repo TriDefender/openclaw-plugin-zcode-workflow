@@ -750,14 +750,15 @@ the same `token`/source. This two-step flow is this host's confirmation
 window; the token expires after 30 minutes.
 
 On a clean compile and confirmation the run starts in the background and you
-get a run id. **Mount the status card before waiting** (§17): on a Control UI
-session call `workflow_dashboard { run_id, live: true }` and then `show_widget`
-exactly with its returned parameters (`pin: true`) — the panel renders the
-phase board, the ask/report counters, recent logs and hole/escalation banners,
-and refreshes itself while the run goes. On a chat-only surface call
-`workflow_dashboard { run_id }` and hand the returned JSON to the core
-`dashboard` tool (static snapshot; refresh by re-applying after each
-`workflow_wait`).
+get a run id. **Mount the status card before waiting** (§17). Default on every surface:
+call `workflow_dashboard { run_id }` and hand the returned JSON to the core
+`dashboard` tool (native `session:report` card; refresh by re-applying after
+each `workflow_wait`). The `live: true` HTML panel self-refreshes, but it
+renders in an iframe on the widget sandbox port (`sandboxPort`) — if the
+viewer's browser cannot reach that port (typical behind tailscale serve /
+reverse proxies, which forward only the main gateway port), the frame dies
+with `ERR_CONNECTION_REFUSED`. Use it only when the sandbox port is known
+reachable for that viewer; never as the default.
 
 **Wait, don't poll**: `workflow_wait` blocks until the run
 settles (completed / errored / stopped / waiting_hole / waiting_question) and
@@ -1298,9 +1299,11 @@ drafts under `.zcode-workflow/drafts/`, saved definitions under
 ## 17. The status surfaces: live panel or native card
 
 ZCode shows a run's phase graph while it executes. This host has two equivalents;
-pick by surface, not by taste:
+default to the native card on every surface, and pick the live panel only when
+the viewer's browser can reach the widget sandbox port — this environment's
+standing decision (2026-11-23) after the iframe path died behind tailscale serve.
 
-- **Control UI session → the live panel.** `workflow_dashboard { run_id, live: true }`
+- **Live panel — opt-in, needs sandbox reachability.** `workflow_dashboard { run_id, live: true }`
   returns exact `show_widget` parameters: `pin: true`, grant
   `zcode-workflow.runs`, and `widget_code` from `skills/workflow/dashboard.html`
   with the run id injected. Call `show_widget` with that JSON once. The panel
@@ -1310,7 +1313,7 @@ pick by surface, not by taste:
   no further turns from you, including after your turn ends and the run keeps
   going in the background. It also self-heals to the newest run when the id
   placeholder was not injected.
-- **Chat-only surface (or a plain snapshot) → the native card.**
+- **Default on every surface → the native card.**
   `workflow_dashboard { run_id }` returns the exact core `dashboard` parameters:
   `action: "widget_put"`, `pluginKind: "session:report"`, stable `name`
   `zcode-workflow-status-<runId>`, `props.blocks` with metrics, phase table,

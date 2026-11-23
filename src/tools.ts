@@ -268,7 +268,7 @@ export function buildToolDefs(): ToolDef[] {
             `Run started: ${meta.id} ("${meta.name}").`,
             `Script: ${plan.draftPath}`,
             `Wait for it with workflow_wait { run_id: "${meta.id}" }; snapshot anytime with workflow_get. Do not poll in a loop.`,
-            `Before waiting, mount a status card: on a Control UI session call workflow_dashboard { run_id: "${meta.id}", live: true } and show_widget its params (self-refreshing panel); otherwise call workflow_dashboard { run_id: "${meta.id}" } and immediately pass its JSON to the core dashboard tool (widget_put, pluginKind session:report — refresh it by re-applying after each workflow_wait).`, 
+            `Before waiting, mount a status card: call workflow_dashboard { run_id: "${meta.id}" } and immediately pass its JSON to the core dashboard tool (widget_put, pluginKind session:report — refresh it by re-applying after each workflow_wait). Default to the native card: live:true renders an HTML panel in the mcp-app-sandbox iframe on sandboxPort, which remote/reverse-proxied browsers usually cannot reach (ERR_CONNECTION_REFUSED); use live:true only when the sandbox port is known reachable.`, 
           ].join("\n"),
           { runId: meta.id },
         );
@@ -775,7 +775,7 @@ export function buildToolDefs(): ToolDef[] {
     name: "workflow_dashboard",
     label: "Workflow Status Dashboard",
     description:
-      "Status surface for a workflow run. Default: core dashboard widget_put parameters for a native session:report card — a static snapshot that updates only when you re-apply it (call the dashboard tool with the returned JSON in the same turn; reuse the same widget name). Use live: true on a Control UI session instead: it returns show_widget parameters for a self-refreshing panel (2.5s poll of the zcode-workflow.runs binding) that follows the background run with no further turns. The live path needs show_widget plus the binding grant; chat-only surfaces should use the default card.",
+      "Status surface for a workflow run. Default: core dashboard widget_put parameters for a native session:report card — a static snapshot that updates only when you re-apply it (call the dashboard tool with the returned JSON in the same turn; reuse the same widget name). Use live: true on a Control UI session instead: it returns show_widget parameters for a self-refreshing panel (2.5s poll of the zcode-workflow.runs binding) that follows the background run with no further turns. CAUTION: the live panel renders inside the mcp-app-sandbox iframe on sandboxPort; when the viewer's browser cannot reach that port (tailscale serve / reverse proxies usually forward only the main gateway port), the frame stays dead with ERR_CONNECTION_REFUSED — prefer the default native card there. The live path also needs show_widget plus the binding grant; chat-only surfaces should use the default card.",
     parameters: Type.Object({
       run_id: Type.Optional(Type.String({ description: "Run id; omitted = the most recent run in this workspace." })),
       live: Type.Optional(Type.Boolean({ description: "true: return show_widget params for the self-refreshing Control UI panel instead of the static session:report card." })),

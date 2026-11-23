@@ -1,0 +1,7 @@
+{"kind":"status","state":"running","seq":1,"at":"2026-11-23T20:55:35.464Z"}
+{"kind":"phase","name":"A exec: 回合结束期间沉睡","seq":2,"at":"2026-11-23T20:55:35.467Z"}
+{"kind":"world","key":"66704fcd","result":{"exitCode":0,"stdout":"phase-a-done\n","stderr":""},"seq":3,"at":"2026-11-23T20:56:20.326Z"}
+{"kind":"phase","name":"B ask: 无存活回合时的子代理跳转","seq":4,"at":"2026-11-23T20:56:20.327Z"}
+{"kind":"ask","agent":"probe","agentIndex":0,"instructions":"健康探针。只回复两个字：OK","result":"OK","typed":false,"seq":5,"at":"2026-11-23T20:56:29.984Z"}
+{"kind":"phase","name":"C finish","seq":6,"at":"2026-11-23T20:56:30.010Z"}
+{"kind":"status","state":"errored","detail":"WorkflowError: report(item, \"cross-turn-probe\"): no such preset artifact (declare it with artifact.chart/table/metrics/board before tagging items)","seq":7,"at":"2026-11-23T20:56:30.010Z"}

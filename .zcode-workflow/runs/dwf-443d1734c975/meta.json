@@ -1,0 +1,29 @@
+{
+  "id": "dwf-443d1734c975",
+  "agentId": "coder",
+  "name": "跨回合存活探针",
+  "state": "completed",
+  "createdAt": "2026-11-23T20:59:21.802Z",
+  "updatedAt": "2026-11-23T20:59:22.171Z",
+  "scriptPath": ".zcode-workflow/drafts/workflow.1.ts",
+  "effectiveScriptHash": "428c49eed55b22dcd6c3df4b6f680e9699577fba4143e7554b600422dae3dc28",
+  "phases": [
+    "A exec: 回合结束期间沉睡",
+    "B ask: 无存活回合时的子代理跳转",
+    "C finish"
+  ],
+  "commands": [
+    "bash"
+  ],
+  "agentNames": [
+    "probe"
+  ],
+  "holes": [],
+  "pendingQuestions": [],
+  "fills": {},
+  "supersededFrom": "dwf-00c00ae90a88",
+  "result": {
+    "slept": "phase-a-done",
+    "answer": "OK"
+  }
+}
