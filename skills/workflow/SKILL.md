@@ -258,9 +258,11 @@ for the world failing to answer (spawn failure, timeout, output over the cap).
 A test suite can print more than the 16 MiB cap: a gate that reads only
 `exitCode` passes `{ output: "discard" }`, and a gate that hands the failure on
 passes `{ output: { tail: 16_384 } }`. The command name must be a compile-time
-string literal, because the user approves the script's command set at
-confirmation: interpolate paths, flags and round numbers into the **args
-array**, never into the command. Open-ended editing belongs to a subagent;
+string literal — or a top-level `const` bound to one (`const PY = "python3";
+world.run(PY, [...])` resolves statically) — because the user approves the
+script's command set at confirmation: interpolate paths, flags and round
+numbers into the **args array**, never into the command (`let`/`var` and
+computed values stay rejected). Open-ended editing belongs to a subagent;
 `world.run` is for checks your control flow branches on.
 
 **Choose the gate before you write it.** A gate decides exactly as much as the
@@ -748,12 +750,14 @@ the same `token`/source. This two-step flow is this host's confirmation
 window; the token expires after 30 minutes.
 
 On a clean compile and confirmation the run starts in the background and you
-get a run id. **Mount the status panel before waiting** (§17): call
-`workflow_dashboard { run_id }` and then `show_widget` exactly with its
-returned parameters (`pin: true`). The panel renders the phase timeline, the
-ask/report counters, recent logs and hole/escalation banners, and refreshes
-itself while the run goes — this host's equivalent of the confirmation dialog's
-live phase graph.
+get a run id. **Mount the status card before waiting** (§17): on a Control UI
+session call `workflow_dashboard { run_id, live: true }` and then `show_widget`
+exactly with its returned parameters (`pin: true`) — the panel renders the
+phase board, the ask/report counters, recent logs and hole/escalation banners,
+and refreshes itself while the run goes. On a chat-only surface call
+`workflow_dashboard { run_id }` and hand the returned JSON to the core
+`dashboard` tool (static snapshot; refresh by re-applying after each
+`workflow_wait`).
 
 **Wait, don't poll**: `workflow_wait` blocks until the run
 settles (completed / errored / stopped / waiting_hole / waiting_question) and
@@ -769,7 +773,9 @@ Read the terminal state precisely. A run ends in exactly one of these states:
   an artifact whose source file was missing, an answer that failed validation
   twice). Replaying it would fail the same way, so `workflow_resume` refuses
   it; edit the run's script file, which the result names, and resubmit it with
-  `workflow_amend` and `path`.
+  `workflow_amend` and `path`. For a transient failure (provider, host,
+  authority) you may amend with the **unchanged** script: the finished work
+  replays from the journal and only the rest re-runs.
 - **stopped** — resumable as-is with `workflow_resume`. The stop reason says
   why: `user` (leave it alone unless they ask), `model` (you stopped it),
   `interrupted` (the gateway exited or a question was resolved; resume it).
@@ -792,7 +798,10 @@ upstream change cascades downstream).
 `scriptPath` names it, so the script never has to live in your context: edit it
 in place and pass `path`; pass `script` only for something genuinely new. A
 `path` whose bytes still equal what the run ran is refused as `script_unchanged`
-— your edit did not land — with nothing stopped and nothing created.
+only when that run already **completed** with the same settings (a full-cache
+replay would change nothing). On an errored, stopped, interrupted or running
+run the same bytes mean "restart with the cache": the finished phases settle
+from the imported journal and the rest runs again.
 
 **Repair a run while it is still going.** When a run is heading the wrong way,
 do not wait for it and do not stop it first: call `workflow_amend` on it. The
@@ -1276,39 +1285,44 @@ before the hole replays from the journal at no cost.
 - `workflow_resume { run_id }` — resume a stopped/interrupted run unchanged;
   its journal replays everything that settled.
 - `workflow_resolve_question { question_id, answer }` — §14.
-- `workflow_dashboard { run_id? }` — §17: returns exact core `dashboard`
-  `widget_put` parameters for a native `session:report` card. Call `dashboard`
-  with them in the same turn. Do not use `show_widget`.
+- `workflow_dashboard { run_id?, live? }` — §17: by default returns exact core
+  `dashboard` `widget_put` parameters for a native `session:report` card (call
+  `dashboard` with them in the same turn). With `live: true` returns `show_widget`
+  parameters for the self-refreshing Control UI panel.
 
 Everything the run leaves behind is in the workspace: run records and journals
 under `.zcode-workflow/runs/`, artifacts under `.zcode-workflow/artifacts/`,
 drafts under `.zcode-workflow/drafts/`, saved definitions under
 `.zcode-workflow/saved/`.
 
-## 17. The live status card (native dashboard)
+## 17. The status surfaces: live panel or native card
 
-ZCode shows a run's phase graph while it executes. On this host the equivalent
-is a native `session:report` card (`<openclaw-report-widget>`, previewSafe).
-The Control UI draws it from the board snapshot. There is no HTML document,
-no widget sandbox, and no loopback port, so Tailscale and other remote
-Control UI clients can see it.
+ZCode shows a run's phase graph while it executes. This host has two equivalents;
+pick by surface, not by taste:
 
-`workflow_dashboard { run_id }` does not mount the card itself (this plugin is
-not a trusted gateway caller). It returns the exact core `dashboard` parameters:
+- **Control UI session → the live panel.** `workflow_dashboard { run_id, live: true }`
+  returns exact `show_widget` parameters: `pin: true`, grant
+  `zcode-workflow.runs`, and `widget_code` from `skills/workflow/dashboard.html`
+  with the run id injected. Call `show_widget` with that JSON once. The panel
+  then polls the plugin's `zcode-workflow.dashboard` gateway method through the
+  widget bridge every 2.5s and re-renders itself — phase board, ask/report
+  counters, recent logs, hole/escalation banners, errors and conclusion — with
+  no further turns from you, including after your turn ends and the run keeps
+  going in the background. It also self-heals to the newest run when the id
+  placeholder was not injected.
+- **Chat-only surface (or a plain snapshot) → the native card.**
+  `workflow_dashboard { run_id }` returns the exact core `dashboard` parameters:
+  `action: "widget_put"`, `pluginKind: "session:report"`, stable `name`
+  `zcode-workflow-status-<runId>`, `props.blocks` with metrics, phase table,
+  recent logs, hole/question text and conclusion. The Control UI draws it from
+  the board snapshot — no HTML document, no widget sandbox, no loopback port —
+  so Tailscale and other remote clients can see it. A native report is a
+  **snapshot**: it updates only when `dashboard` writes new props, so after each
+  `workflow_wait` return call `workflow_dashboard` again and re-apply the params
+  (reuse the same `name`) to refresh it.
 
-- `action: "widget_put"`
-- `pluginKind: "session:report"`
-- stable `name`: `zcode-workflow-status-<runId>`
-- `props.blocks`: metrics, phase table, recent logs, hole/question text, conclusion
-
-Call `dashboard` with that JSON in the same turn. Reuse the same `name` to
-refresh. Do not call `show_widget`, and do not mount `skills/workflow/dashboard.html`
-— that file is retired because its sandbox origin is loopback-only.
-
-When `workflow_wait` returns (settled or timed out), call `workflow_dashboard`
-again and re-apply the params so the card matches the run. The card cannot
-poll; a native report updates only when `dashboard` writes new props, which
-the Control UI receives on its existing gateway connection.
+Neither surface mounts itself: relay the returned JSON to `show_widget` / the
+core `dashboard` tool in the same turn. Use at most one surface per run.
 
 ## 18. Background runs: fire, end the turn, recap automatically
 

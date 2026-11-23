@@ -30,6 +30,14 @@ function contextFor(api: object): ToolContext {
     };
     contexts.set(api, ctx);
   }
+  // Managed instances expose lifecycle.runInBackgroundContext; capture it so
+  // background runs detach from the starting turn instead of retaining its
+  // (expiring) tool-caller authority. Fallback keeps direct execution for
+  // hosts and test harnesses without the capability.
+  const runInBackgroundContext = (api as unknown as ToolHostApi).lifecycle?.runInBackgroundContext;
+  if (runInBackgroundContext && !ctx.background) {
+    ctx.background = (run) => runInBackgroundContext(run);
+  }
   return ctx;
 }
 

@@ -179,6 +179,34 @@ export function compileWorkflow(opts: CompileOptions): CompiledScript {
   const holeNames = new Set<string>();
   const artifactKinds = new Map<string, string>();
 
+  // ---- const string bindings ----
+  // 'const PY = "python3"' resolves wherever a compile-time literal is required,
+  // so scripts stay DRY without widening what the user approves: resolution is
+  // fully static (const + string-literal initializer only; let/var stay dynamic
+  // and are rejected), and the runtime still membership-checks every executed
+  // command against meta.commands, so the approved set can never be bypassed.
+  const constStringLiterals = new Map<string, string>();
+  const collectConstStrings = (node: ts.Node): void => {
+    if (ts.isVariableStatement(node) && (node.declarationList.flags & ts.NodeFlags.Const) !== 0) {
+      for (const decl of node.declarationList.declarations) {
+        if (!ts.isIdentifier(decl.name)) continue;
+        const init = decl.initializer;
+        if (init && (ts.isStringLiteral(init) || ts.isNoSubstitutionTemplateLiteral(init))) {
+          constStringLiterals.set(decl.name.text, init.text);
+        }
+      }
+    }
+    ts.forEachChild(node, collectConstStrings);
+  };
+  collectConstStrings(wrapperFile);
+
+  /** A string literal, a no-substitution template literal, or a const identifier bound to one. */
+  const literalString = (expr: ts.Expression): string | undefined => {
+    if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) return expr.text;
+    if (ts.isIdentifier(expr)) return constStringLiterals.get(expr.text);
+    return undefined;
+  };
+
   const insideArrayCallback = (chain: ts.Node[]): boolean => {
     for (let i = chain.length - 1; i > 0; i--) {
       const node = chain[i]!;
@@ -204,25 +232,27 @@ export function compileWorkflow(opts: CompileOptions): CompiledScript {
       // phase("name")
       if (ts.isIdentifier(callee) && callee.text === "phase") {
         const nameArg = node.arguments[0];
+        const name = nameArg ? literalString(nameArg) : undefined;
         const standalone = ts.isExpressionStatement(node.parent);
-        if (!nameArg || !ts.isStringLiteral(nameArg) || nameArg.text.length === 0) {
-          pushDiagnostic(node, 9004, "phase() needs a non-empty compile-time string literal name");
+        if (!nameArg || name === undefined || name.length === 0) {
+          pushDiagnostic(node, 9004, "phase() needs a non-empty compile-time string literal name (a const string identifier is resolved)");
         } else if (!standalone) {
-          pushDiagnostic(node, 9004, `phase("${nameArg.text}") must be a standalone statement`);
+          pushDiagnostic(node, 9004, `phase("${name}") must be a standalone statement`);
         } else {
-          meta.phases.push(nameArg.text);
+          meta.phases.push(name);
         }
       }
 
       // agent(name, persona)
       if (ts.isIdentifier(callee) && callee.text === "agent") {
         const nameArg = node.arguments[0];
-        if (nameArg && ts.isStringLiteral(nameArg) && nameArg.text.length > 0) {
-          if (seenAgentNames.has(nameArg.text)) {
-            pushDiagnostic(node, 9002, `duplicate subagent name "${nameArg.text}": names are identities and must be unique within the run`);
+        const agentName = nameArg ? literalString(nameArg) : undefined;
+        if (nameArg && agentName !== undefined && agentName.length > 0) {
+          if (seenAgentNames.has(agentName)) {
+            pushDiagnostic(node, 9002, `duplicate subagent name "${agentName}": names are identities and must be unique within the run`);
           }
-          seenAgentNames.add(nameArg.text);
-          meta.agentNames.push(nameArg.text);
+          seenAgentNames.add(agentName);
+          meta.agentNames.push(agentName);
         } else if (nameArg) {
           meta.dynamicAgentNames += 1;
         }
@@ -234,8 +264,9 @@ export function compileWorkflow(opts: CompileOptions): CompiledScript {
           for (const prop of personaArg.properties) {
             if (!ts.isPropertyAssignment(prop)) continue;
             const propName = prop.name.getText(wrapperFile);
-            if (propName === "model" && ts.isStringLiteral(prop.initializer) && !meta.models.includes(prop.initializer.text)) {
-              meta.models.push(prop.initializer.text);
+            if (propName === "model") {
+              const modelId = literalString(prop.initializer);
+              if (modelId !== undefined && !meta.models.includes(modelId)) meta.models.push(modelId);
             }
             if (propName === "budget") {
               meta.notes.push("persona.budget is recorded but not enforced by this host");
@@ -254,10 +285,11 @@ export function compileWorkflow(opts: CompileOptions): CompiledScript {
       ) {
         meta.hasWorldRun = true;
         const cmdArg = node.arguments[0];
-        if (!cmdArg || !ts.isStringLiteral(cmdArg)) {
-          pushDiagnostic(node, 9003, "world.run's command must be a compile-time string literal; interpolate runtime values into the args array");
-        } else if (!meta.commands.includes(cmdArg.text)) {
-          meta.commands.push(cmdArg.text);
+        const cmd = cmdArg ? literalString(cmdArg) : undefined;
+        if (!cmdArg || cmd === undefined) {
+          pushDiagnostic(node, 9003, "world.run's command must be a compile-time string literal (a const string identifier is resolved); interpolate runtime values into the args array");
+        } else if (!meta.commands.includes(cmd)) {
+          meta.commands.push(cmd);
         }
       }
 
@@ -291,10 +323,11 @@ export function compileWorkflow(opts: CompileOptions): CompiledScript {
       // model("id")
       if (ts.isIdentifier(callee) && callee.text === "model") {
         const idArg = node.arguments[0];
-        if (idArg && ts.isStringLiteral(idArg)) {
-          if (!meta.models.includes(idArg.text)) meta.models.push(idArg.text);
+        const modelId = idArg ? literalString(idArg) : undefined;
+        if (idArg && modelId !== undefined) {
+          if (!meta.models.includes(modelId)) meta.models.push(modelId);
         } else {
-          pushDiagnostic(node, 9011, "model() needs a compile-time string literal model id");
+          pushDiagnostic(node, 9011, "model() needs a compile-time string literal model id (a const string identifier is resolved)");
         }
       }
 
@@ -303,17 +336,18 @@ export function compileWorkflow(opts: CompileOptions): CompiledScript {
         const kind = callee.name.text;
         if (["file", "markdown", "chart", "table", "metrics", "board"].includes(kind)) {
           const idArg = node.arguments[0];
-          if (!idArg || !ts.isStringLiteral(idArg) || !/^[A-Za-z0-9_.-]{1,64}$/.test(idArg.text)) {
-            pushDiagnostic(node, 9005, `artifact.${kind}: id must be a compile-time literal of 1-64 characters from [A-Za-z0-9_.-]`);
-          } else if (artifactKinds.has(idArg.text) && artifactKinds.get(idArg.text) !== kind) {
-            pushDiagnostic(node, 9006, `artifact id "${idArg.text}" is already used as ${artifactKinds.get(idArg.text)}; one id belongs to one artifact kind`);
+          const artifactId = idArg ? literalString(idArg) : undefined;
+          if (!idArg || artifactId === undefined || !/^[A-Za-z0-9_.-]{1,64}$/.test(artifactId)) {
+            pushDiagnostic(node, 9005, `artifact.${kind}: id must be a compile-time literal of 1-64 characters from [A-Za-z0-9_.-] (a const string identifier is resolved)`);
+          } else if (artifactKinds.has(artifactId) && artifactKinds.get(artifactId) !== kind) {
+            pushDiagnostic(node, 9006, `artifact id "${artifactId}" is already used as ${artifactKinds.get(artifactId)}; one id belongs to one artifact kind`);
           } else {
-            artifactKinds.set(idArg.text, kind);
-            if (!meta.artifacts.some((a) => a.id === idArg!.getText())) {
+            artifactKinds.set(artifactId, kind);
+            if (!meta.artifacts.some((a) => a.id === artifactId)) {
               if (meta.artifacts.length >= 32) {
                 pushDiagnostic(node, 9007, "a run may publish at most 32 artifact ids");
               } else {
-                meta.artifacts.push({ id: (idArg as ts.StringLiteral).text, kind: kind as never });
+                meta.artifacts.push({ id: artifactId, kind: kind as never });
               }
             }
           }
@@ -324,10 +358,11 @@ export function compileWorkflow(opts: CompileOptions): CompiledScript {
       if (ts.isIdentifier(callee) && callee.text === "report") {
         const tagArg = node.arguments[1];
         if (tagArg) {
-          if (!ts.isStringLiteral(tagArg)) {
-            pushDiagnostic(tagArg, 9008, "report()'s artifactId must be a compile-time string literal");
-          } else if (!meta.reportTags.includes(tagArg.text)) {
-            meta.reportTags.push(tagArg.text);
+          const tag = literalString(tagArg);
+          if (tag === undefined) {
+            pushDiagnostic(tagArg, 9008, "report()'s artifactId must be a compile-time string literal (a const string identifier is resolved)");
+          } else if (!meta.reportTags.includes(tag)) {
+            meta.reportTags.push(tag);
           }
         }
       }
@@ -339,27 +374,28 @@ export function compileWorkflow(opts: CompileOptions): CompiledScript {
         const hasBody =
           node.arguments.length >= 1 &&
           (ts.isArrowFunction(node.arguments[node.arguments.length - 1]!) || ts.isFunctionExpression(node.arguments[node.arguments.length - 1]!));
-        if (!nameArg || !ts.isStringLiteral(nameArg) || nameArg.text.length === 0 || nameArg.text.length > 128) {
-          pushDiagnostic(node, 9012, "hole() needs a literal name of 1-128 characters");
+        const holeName = nameArg ? literalString(nameArg) : undefined;
+        if (!nameArg || holeName === undefined || holeName.length === 0 || holeName.length > 128) {
+          pushDiagnostic(node, 9012, "hole() needs a literal name of 1-128 characters (a const string identifier is resolved)");
         } else if (!typeArg) {
-          pushDiagnostic(node, 9012, `hole("${nameArg.text}"): the type argument T must be written out`);
-        } else if (holeNames.has(nameArg.text)) {
-          pushDiagnostic(node, 9012, `duplicate hole name "${nameArg.text}": names are unique among the script's holes and phases`);
+          pushDiagnostic(node, 9012, `hole("${holeName}"): the type argument T must be written out`);
+        } else if (holeNames.has(holeName)) {
+          pushDiagnostic(node, 9012, `duplicate hole name "${holeName}": names are unique among the script's holes and phases`);
         } else if (insideArrayCallback(currentChain)) {
-          pushDiagnostic(node, 9012, `hole("${nameArg.text}") may not sit inside an array-method fan-out callback (a for...of body is fine)`);
+          pushDiagnostic(node, 9012, `hole("${holeName}") may not sit inside an array-method fan-out callback (a for...of body is fine)`);
         } else {
-          holeNames.add(nameArg.text);
+          holeNames.add(holeName);
           const promptArg = node.arguments[1];
           meta.holes.push({
-            name: nameArg.text,
+            name: holeName,
             typeName: typeArg.getText(wrapperFile),
             prompt: promptArg && ts.isStringLiteral(promptArg) ? promptArg.text : "",
             hasBody,
-            id: `hole#${siteHash(nameArg.text)}`,
+            id: `hole#${siteHash(holeName)}`,
           });
           // splice the fill as an async arrow body when one exists and no body is present
-          if (!hasBody && fillTexts.has(nameArg.text)) {
-            splices.push({ at: node.end - 1, text: `, async () => {\n${fillTexts.get(nameArg.text)}\n}` });
+          if (!hasBody && fillTexts.has(holeName)) {
+            splices.push({ at: node.end - 1, text: `, async () => {\n${fillTexts.get(holeName)}\n}` });
           }
         }
       }

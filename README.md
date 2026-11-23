@@ -52,19 +52,19 @@ This plugin's stated purpose is **deterministic gating of agent workflows**: it 
 | `workflow_resolve_question`（答案送入子代理会话，作为该 ask 的结果入 journal） | `ResolveWorkflowQuestion` |
 | `workflow_eval_snippet`（同步、零持久化、snippet facade） | `EvalWorkflowSnippet` |
 | `workflow_save` / `workflow_list_saved` | `SaveWorkflow` / `ListSavedWorkflows` |
-| `workflow_dashboard`（直接推送原生 `session:report` 状态卡，不走 iframe） | zcode 确认对话框的实时 phase 图（宿主侧等价物） |
+| `workflow_dashboard`（默认：原生 `session:report` 状态卡；`live: true`：自刷新 Control UI 面板） | zcode 确认对话框的实时 phase 图（宿主侧等价物） |
 
-### 实时状态卡（原生 session:report，不走 iframe）
+### 状态卡：静态 session:report + 可选 live 面板
 
-run 启动后模型按 SKILL §17 调 `workflow_dashboard { run_id }`，再把返回的 JSON
+默认（chat 通道/快照场景）：模型调 `workflow_dashboard { run_id }`，把返回的 JSON
 原样交给核心 `dashboard`（`action: "widget_put"`，`pluginKind: "session:report"`）。
-Control UI 用 `<openclaw-report-widget>`（previewSafe）直接画 props，没有文档框，
-也不访问 widget 沙箱端口，所以 Tailscale 远程客户端能打开。
+Control UI 用 `<openclaw-report-widget>`（previewSafe）直接画 props；卡片是快照，
+`workflow_wait` 返回后重新 apply 即可刷新。
 
-第三方插件不能调用 `runtime.gateway.request`（仅 bundled / trusted official），
-因此插件不自己写看板。`workflow_wait` 返回后再次 `workflow_dashboard` 并复用同一
-widget name 刷新。`skills/workflow/dashboard.html` 已退役：它的沙箱 origin 只有
-本机回环能直达。
+Control UI 会话可改用 `workflow_dashboard { run_id, live: true }` + `show_widget`
+（`pin: true`，grant `zcode-workflow.runs`）：`skills/workflow/dashboard.html` 通过
+widget 桥的 `openclaw.data.read` 每 2.5s 拉取 gateway 方法 `zcode-workflow.dashboard`，
+后台 run 推进/报错时自动更新，不再依赖模型回合重新推送。
 
 ### 落盘布局（都在 agent 主 workspace 下）
 

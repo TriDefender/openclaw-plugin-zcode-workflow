@@ -110,6 +110,14 @@ export class WorkflowRunner {
     private readonly workspaceDir: string,
     private readonly logger: RunnerLogger,
     private readonly readConfig: () => unknown,
+    /**
+     * Runs the detached execution outside the starting turn's async context.
+     * Wired to api.lifecycle.runInBackgroundContext when the host provides it:
+     * background work must not retain the tool-call authority of the turn that
+     * launched it, or the next subagent dispatch after that turn ends fails
+     * with 'agent tool caller authority is no longer active'.
+     */
+    private readonly runInBackground: (run: () => Promise<void>) => Promise<void> = (run) => run(),
   ) {}
 
   private poolFor(meta: RunMeta): SubagentPool {
@@ -118,7 +126,7 @@ export class WorkflowRunner {
       throw new WorkflowError(`run ${meta.id} has no owning agent`, "no_agent");
     }
     const limit = resolveAskConcurrency(this.readConfig(), agentId, meta.maxConcurrency);
-    return new SubagentPool(this.subagents, meta.id, agentId, this.workspaceDir, meta.subagentModel, new Semaphore(limit));
+    return new SubagentPool(this.subagents, meta.id, agentId, this.workspaceDir, meta.subagentModel, new Semaphore(limit), this.logger);
   }
 
   isLive(runId: string): boolean {
@@ -151,7 +159,11 @@ export class WorkflowRunner {
       },
     };
     this.live.set(meta.id, execution);
-    void this.execute(meta, state, (fn) => (onAbort = fn))
+    // Detach from the invoking turn: runInBackgroundContext strips the turn's
+    // tool-caller identity and request scope while keeping the plugin instance's
+    // Gateway binding, so subagent dispatches stay admitted after the turn ends.
+    const launched = this.runInBackground(() => this.execute(meta, state, (fn) => (onAbort = fn)));
+    void Promise.resolve(launched)
       .catch((err) => this.logger.error(`workflow run ${meta.id} crashed: ${(err as Error).stack ?? err}`))
       .finally(() => execution.settle());
   }

@@ -51,10 +51,21 @@ export interface Persona {
 
 const ASK_WAIT_CHUNK_MS = 60_000;
 
+export interface PoolLogger {
+  warn(message: string): void;
+}
+
 export class SubagentPool {
   /** name (or synthetic) → per-agent ask counter, for journal cache indexes. */
   private askCounts = new Map<string, number>();
   private seenNames = new Set<string>();
+  /**
+   * Set when OpenClaw rejected a model override because the ask ran outside an
+   * authorized request scope (background runs) without the operator opt-in
+   * (plugins.entries.<id>.subagent.allowModelOverride). Later asks then use the
+   * configured default model directly instead of failing the run.
+   */
+  private modelOverrideBlocked = false;
 
   constructor(
     private readonly runtime: SubagentRuntime,
@@ -63,6 +74,7 @@ export class SubagentPool {
     private readonly workspaceDir: string | undefined,
     private readonly defaultModel: string | undefined,
     private readonly semaphore: Semaphore,
+    private readonly logger?: PoolLogger,
   ) {}
 
   /** Runtime identity check: a computed duplicate name fails the run. */
@@ -98,15 +110,38 @@ export class SubagentPool {
 
     const release = await this.semaphore.acquire();
     try {
-      const { runId: subRunId } = await this.runtime.run({
+      const base = {
         sessionKey,
         message,
         extraSystemPrompt,
-        promptMode: "minimal",
+        promptMode: "minimal" as const,
         cwd: this.workspaceDir,
-        model: modelParts ? modelParts[1] : (persona?.model ?? this.defaultModel),
-        provider: modelParts?.[0],
-      });
+      };
+      const wantsOverride = Boolean(modelParts || persona?.model || this.defaultModel);
+      const dispatch = (): Promise<{ runId: string; sessionKey?: string }> =>
+        this.runtime.run(
+          this.modelOverrideBlocked || !wantsOverride
+            ? base
+            : {
+                ...base,
+                model: modelParts ? modelParts[1] : persona?.model ?? this.defaultModel,
+                ...(modelParts?.[0] ? { provider: modelParts[0] } : {}),
+              },
+        );
+      let admitted: { runId: string; sessionKey?: string };
+      try {
+        admitted = await dispatch();
+      } catch (err) {
+        if (!wantsOverride || this.modelOverrideBlocked || !isModelOverrideRejection(err)) throw err;
+        this.modelOverrideBlocked = true;
+        this.logger?.warn(
+          `workflow ask on ${name ?? "(anonymous)"}: model override was rejected outside a request scope ` +
+          `(${(err as Error).message}); continuing on the configured default model. ` +
+          `Set plugins.entries.zcode-workflow.subagent.allowModelOverride: true to keep overrides in background runs.`,
+        );
+        admitted = await dispatch();
+      }
+      const { runId: subRunId } = admitted;
       // Wait in bounded chunks so a long ask never wedges the run silently.
       const deadline = Date.now() + 24 * 60 * 60 * 1000;
       while (Date.now() < deadline) {
@@ -164,6 +199,16 @@ export class SubagentPool {
     }
     throw new AskError(`subagent completed but no reply text was found (${sessionKey})`);
   }
+}
+
+/**
+ * OpenClaw rejects plugin subagent model overrides issued outside an authorized
+ * Gateway request unless the operator opted in per plugin. Background runs
+ * (detached from the starting turn) hit exactly that path.
+ */
+function isModelOverrideRejection(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /provider\/model override|allowModelOverride|not trusted for fallback/i.test(message);
 }
 
 /** Best-effort extraction of assistant text from an OpenClaw session message. */

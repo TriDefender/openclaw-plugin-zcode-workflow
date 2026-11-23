@@ -28,6 +28,13 @@ export interface ToolHostApi {
     subagent: SubagentRuntime;
   };
   logger: RunnerLogger;
+  /**
+   * Managed plugin instances expose lifecycle.runInBackgroundContext: it runs
+   * work detached from the calling turn/request async context while keeping the
+   * instance's host bindings. Background workflow runs need it so subagent
+   * dispatches survive the end of the turn that started them.
+   */
+  lifecycle?: { runInBackgroundContext?: <T>(run: () => T) => T };
 }
 
 export interface ToolContext {
@@ -36,6 +43,8 @@ export interface ToolContext {
   pendingPlans: Map<string, PendingPlan>;
   /** Live runners by workspace directory. */
   runners: Map<string, WorkflowRunner>;
+  /** Detached-execution wrapper from api.lifecycle.runInBackgroundContext, when available. */
+  background?: (run: () => Promise<void>) => Promise<void>;
   /** Session-bound facts captured by the v2 tool factory for this invocation. */
   session?: { sessionKey?: string; agentId?: string; workspaceDir?: string; assertCurrent?: () => void };
 }
@@ -99,6 +108,7 @@ function runnerOf(ctx: ToolContext, workspaceDir: string): WorkflowRunner {
       workspaceDir,
       ctx.api.logger,
       () => ctx.api.runtime.config.current(),
+      ctx.background,
     );
     ctx.runners.set(workspaceDir, runner);
   }
@@ -258,7 +268,7 @@ export function buildToolDefs(): ToolDef[] {
             `Run started: ${meta.id} ("${meta.name}").`,
             `Script: ${plan.draftPath}`,
             `Wait for it with workflow_wait { run_id: "${meta.id}" }; snapshot anytime with workflow_get. Do not poll in a loop.`,
-            `Before waiting: call workflow_dashboard { run_id: "${meta.id}" } and immediately pass its JSON to the core dashboard tool (widget_put, pluginKind session:report). Do not use show_widget or dashboard.html.`, 
+            `Before waiting, mount a status card: on a Control UI session call workflow_dashboard { run_id: "${meta.id}", live: true } and show_widget its params (self-refreshing panel); otherwise call workflow_dashboard { run_id: "${meta.id}" } and immediately pass its JSON to the core dashboard tool (widget_put, pluginKind session:report — refresh it by re-applying after each workflow_wait).`, 
           ].join("\n"),
           { runId: meta.id },
         );
@@ -334,7 +344,7 @@ export function buildToolDefs(): ToolDef[] {
   tool({
     name: "workflow_wait",
     label: "Wait for Workflow",
-    description: "Block until a run this session started settles (completed/errored/stopped/waiting_hole/waiting_question), or the timeout passes. Returns the final result and reported items. When it returns, call workflow_dashboard and apply its dashboard params to refresh the native status card.",
+    description: "Block until a run this session started settles (completed/errored/stopped/waiting_hole/waiting_question), or the timeout passes. Returns the final result and reported items. When it returns, refresh the status card: a live panel needs nothing (it self-refreshes); a static session:report card needs workflow_dashboard + the core dashboard tool again.",
     parameters: Type.Object({
       run_id: Type.String({ description: "Run id from workflow_create." }),
       timeout_ms: Type.Optional(Type.Number({ description: "Wait budget in ms; default 300000, max 1800000." })),
@@ -482,8 +492,11 @@ export function buildToolDefs(): ToolDef[] {
         (params.max_concurrency !== undefined && params.max_concurrency !== old.maxConcurrency) ||
         (params.subagent_model !== undefined && params.subagent_model !== old.subagentModel);
 
-      if (newSource === (await store.readScript(old.id).catch(() => "")) && !settingsChanged) {
-        return failure("script_unchanged: the file's bytes equal what the run already ran. Make your Edit land, or change a setting.");
+      const unchangedScript = newSource === (await store.readScript(old.id).catch(() => ""));
+      if (unchangedScript && !settingsChanged && old.state === "completed") {
+        return failure(
+          "script_unchanged: this run already completed with these exact bytes and settings, so an amend would replay its whole journal and change nothing. Rerun fresh with workflow_create from its scriptPath, or edit the script / change a setting first.",
+        );
       }
 
       const newId = store.newRunId();
@@ -537,7 +550,8 @@ export function buildToolDefs(): ToolDef[] {
       await store.writeScript(newId, newSource);
       runner.start(meta);
       return text(
-        `Amended: run ${newId} ("${meta.name}") supersedes ${old.id} and imports its finished work. Wait with workflow_wait { run_id: "${newId}" }.`,
+        `Amended: run ${newId} ("${meta.name}") supersedes ${old.id} and imports its finished work. Wait with workflow_wait { run_id: "${newId}" }.` +
+        (unchangedScript ? ' Note: the script bytes are unchanged — this is a restart that settles finished phases from the imported journal and re-runs the rest.' : ""),
         { newRunId: newId, superseded: old.id },
       );
     },
@@ -557,7 +571,7 @@ export function buildToolDefs(): ToolDef[] {
       if (runner.isLive(meta.id)) return failure(`Run ${meta.id} is already running.`);
       if (meta.state === "completed") return failure(`Run ${meta.id} completed; to change it, workflow_amend.`);
       if (meta.state === "errored") {
-        return failure(`Run ${meta.id} errored (${meta.error ?? "unknown"}); replaying would fail the same way. Edit ${meta.scriptPath} and workflow_amend.`);
+        return failure(`Run ${meta.id} errored (${meta.error ?? "unknown"}); replaying would fail the same way. Edit ${meta.scriptPath} and workflow_amend — for a transient failure the unchanged script is fine: an amend imports the finished work and only re-runs the rest.`);
       }
       if (meta.state === "waiting_hole") return failure(`Run ${meta.id} is waiting at hole ${meta.pendingHole?.id ?? "?"}; fill it with workflow_fill_hole.`);
       if (meta.state === "waiting_question") return failure(`Run ${meta.id} is waiting on ${meta.pendingQuestions.length} question(s); answer with workflow_resolve_question.`);
@@ -756,14 +770,15 @@ export function buildToolDefs(): ToolDef[] {
     },
   });
 
-  // ---- workflow_dashboard (native session:report card, no HTML) ----
+  // ---- workflow_dashboard (live panel via data binding, or static session:report card) ----
   tool({
     name: "workflow_dashboard",
     label: "Workflow Status Dashboard",
     description:
-      "Return core dashboard widget_put parameters for a native session:report status card (no iframe, no sandbox port): state, elapsed time, phase table, ask/report counters, recent logs, hole/question banners, final conclusion. Call it right after workflow_create confirm, then call the dashboard tool with the returned JSON in the same turn. Reuse the same widget name to refresh. Do not use show_widget or dashboard.html.",
+      "Status surface for a workflow run. Default: core dashboard widget_put parameters for a native session:report card — a static snapshot that updates only when you re-apply it (call the dashboard tool with the returned JSON in the same turn; reuse the same widget name). Use live: true on a Control UI session instead: it returns show_widget parameters for a self-refreshing panel (2.5s poll of the zcode-workflow.runs binding) that follows the background run with no further turns. The live path needs show_widget plus the binding grant; chat-only surfaces should use the default card.",
     parameters: Type.Object({
       run_id: Type.Optional(Type.String({ description: "Run id; omitted = the most recent run in this workspace." })),
+      live: Type.Optional(Type.Boolean({ description: "true: return show_widget params for the self-refreshing Control UI panel instead of the static session:report card." })),
     }),
     handler: async (params, ctx) => {
       const workspaceDir = workspaceOf(ctx);
@@ -775,6 +790,32 @@ export function buildToolDefs(): ToolDef[] {
         runId = runs[0]!.id;
       }
       const meta = await loadRun(store, runId);
+      if (params.live === true) {
+        const templatePath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "skills", "workflow", "dashboard.html");
+        let template: string;
+        try {
+          template = await fs.readFile(templatePath, "utf8");
+        } catch {
+          return failure(`Live dashboard template missing at ${templatePath}; use the default session:report card instead.`);
+        }
+        const widgetCode = template.split("__RUN_ID__").join(runId);
+        const widgetParams = {
+          title: `Workflow: ${meta.name}`.slice(0, 80),
+          name: `zcode-workflow-live-${runId}`.slice(0, 80),
+          pin: true,
+          size: "md" as const,
+          capabilities: { tools: ["zcode-workflow.runs"] },
+          widget_code: widgetCode,
+        };
+        const lines = [
+          `Call show_widget now with EXACTLY these parameters (pin: true mounts it on the session dashboard; the panel then self-refreshes every 2.5s from the zcode-workflow.runs binding, no further turns needed):`,
+          "",
+          "```json",
+          JSON.stringify(widgetParams, null, 2),
+          "```",
+        ];
+        return text(lines.join("\n"), { runId, widgetParams });
+      }
       const { snapshotRun } = await import("./engine/dashboard.js");
       const run = await snapshotRun(workspaceDir, meta.id);
       if (!run) return failure(`No snapshot for run ${meta.id}.`);

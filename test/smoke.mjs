@@ -6,7 +6,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 import { compileWorkflow } from "../dist/engine/compile.js";
+import { createTools } from "../dist/tools.js";
 import { WorkflowRunner } from "../dist/engine/runner.js";
 import { RunStore } from "../dist/engine/store.js";
 import { Journal } from "../dist/engine/journal.js";
@@ -72,7 +74,7 @@ return { count: paths.length, note: v.note, gateCode: gate.exitCode };
 
 // ---------- 2. snippet eval ----------
 {
-  const runner = new WorkflowRunner(new RunStore(workspace), fakeSubs(), workspace, quietLogger());
+  const runner = new WorkflowRunner(new RunStore(workspace), fakeSubs(), workspace, quietLogger(), () => ({}));
   const { logs, result } = await runner.evalSnippet(
     `
 const paths = await files.glob("data/*.txt");
@@ -92,7 +94,7 @@ return { paths, matchLines: matches.length, echo: echo.stdout.trim() };
 
 // ---------- 2b. channel + future pipeline in a snippet ----------
 {
-  const runner = new WorkflowRunner(new RunStore(workspace), fakeSubs(), workspace, quietLogger());
+  const runner = new WorkflowRunner(new RunStore(workspace), fakeSubs(), workspace, quietLogger(), () => ({}));
   const { result } = await runner.evalSnippet(
     `
 const ch = channel<number>("nums");
@@ -113,7 +115,7 @@ return out;
 // ---------- 3. full run with typed ask + artifact ----------
 {
   const store = new RunStore(workspace);
-  const runner = new WorkflowRunner(store, fakeSubs(), workspace, quietLogger());
+  const runner = new WorkflowRunner(store, fakeSubs(), workspace, quietLogger(), () => ({}));
   const script = `
 interface Verdict { ok: boolean; note: string; }
 phase("检查文件");
@@ -146,7 +148,7 @@ return { count: paths.length, note: v.note };
 {
   const store = new RunStore(workspace);
   const subs = fakeSubs();
-  const runner = new WorkflowRunner(store, subs, workspace, quietLogger());
+  const runner = new WorkflowRunner(store, subs, workspace, quietLogger(), () => ({}));
   const script = `
 phase("第一步：勘察");
 const x = await agent("勘察").ask<string>("说一句话");
@@ -180,6 +182,7 @@ return { x, plan };
 function newMeta(store, name) {
   return {
     id: store.newRunId(),
+    agentId: "main",
     name,
     state: "running",
     createdAt: new Date().toISOString(),
@@ -239,6 +242,125 @@ async function waitSettled(store, runId, timeoutMs = 30_000) {
     await new Promise((r) => setTimeout(r, 200));
   }
   throw new Error("run did not settle in " + timeoutMs + "ms");
+}
+
+
+// ---------- 5. 0.1.4: const identifiers resolve as compile-time literals ----------
+{
+  const src = [
+    "const PY = 'python3';",
+    "const P1 = 'scan';",
+    "const TAG = 'board1';",
+    "phase(P1);",
+    "const r = await world.run(PY, ['-c', 'print(1)']);",
+    "report({ ok: r.exitCode === 0 }, TAG);",
+    "return r.exitCode;",
+  ].join("\n");
+  const r = compileWorkflow({ scriptPath: "const.ts", source: src });
+  assert.ok(r.ok, "const script compiles: " + JSON.stringify(r.diagnostics));
+  assert.deepEqual(r.meta.commands, ["python3"]);
+  assert.deepEqual(r.meta.phases, ["scan"]);
+  assert.deepEqual(r.meta.reportTags, ["board1"]);
+
+  const letSrc = src.replace("const PY = 'python3';", "let PY = 'python3';");
+  const letted = compileWorkflow({ scriptPath: "let.ts", source: letSrc });
+  assert.ok(!letted.ok, "let stays dynamic");
+  assert.ok(letted.diagnostics.some((d) => d.code === 9003), "let-bound command rejected");
+}
+
+// ---------- 6. 0.1.4: background wrapper + model-override fallback + amend guard ----------
+{
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dwf-smoke-"));
+  const asks = [];
+  const warnings = [];
+  let overrideRejections = 0;
+  const subs = {
+    async run(params) {
+      if (params.model !== undefined) {
+        overrideRejections += 1;
+        throw new Error('plugin "zcode-workflow" is not trusted for fallback provider/model override requests.');
+      }
+      asks.push(params);
+      return { runId: "sub-" + asks.length, sessionKey: params.sessionKey };
+    },
+    async waitForRun() {
+      return { status: "ok", terminalReply: { disposition: "visible", text: "hello" } };
+    },
+    async getSessionMessages() {
+      return { messages: [] };
+    },
+  };
+  let backgroundRuns = 0;
+  const api = {
+    runtime: {
+      agent: { resolveAgentWorkspaceDir: () => dir },
+      config: { current: () => ({}) },
+      subagent: subs,
+    },
+    logger: { info() {}, warn: (m) => warnings.push(m), error(e) { warnings.push(e); }, debug() {} },
+  };
+  const ctx = {
+    api,
+    pendingPlans: new Map(),
+    runners: new Map(),
+    background: async (run) => {
+      backgroundRuns += 1;
+      return await run();
+    },
+    session: { agentId: "main", sessionKey: "agent:main:dashboard:smoke", workspaceDir: dir },
+  };
+  const defs = createTools(ctx);
+  const byName = (name) => {
+    const found = defs.find((d) => d.name === name);
+    if (!found) throw new Error("tool " + name + " missing");
+    return (params) => found.execute(params);
+  };
+  const create = byName("workflow_create");
+  const wait = byName("workflow_wait");
+  const amend = byName("workflow_amend");
+  const dashboard = byName("workflow_dashboard");
+
+  const script = "phase('p1');\nconst a = agent('echo');\nconst t = await a.ask('say hi');\nreturn { t };";
+  const plan = await create({ script, name: "smoke2", subagent_model: "prov/model-x" });
+  const started = await create({ script, confirm: true, token: plan.details.token });
+  assert.ok(started.details.runId, "run started: " + started.details.text);
+  const runId = started.details.runId;
+
+  const settled = await wait({ run_id: runId, timeout_ms: 15000 });
+  assert.ok(settled.details.text.includes("completed"), "run completed: " + settled.details.text);
+  assert.ok(backgroundRuns >= 1, "background wrapper used");
+  assert.equal(overrideRejections, 1, "override attempted once");
+  assert.equal(asks.length, 1, "ask admitted after fallback");
+  assert.equal(asks[0].model, undefined, "retry dropped the override");
+  assert.ok(warnings.some((w) => String(w).includes("allowModelOverride")), "fallback warning logged");
+
+  const refused = await amend({ run_id: runId });
+  assert.equal(refused.details.ok, false);
+  assert.ok(refused.details.text.includes("script_unchanged"), "completed+unchanged refused");
+
+  const metaFile = path.join(dir, ".zcode-workflow", "runs", runId, "meta.json");
+  const meta = JSON.parse(await fs.readFile(metaFile, "utf8"));
+  meta.state = "errored";
+  meta.error = "SessionMutationAuthorizationChangedError: agent tool caller authority is no longer active";
+  await fs.writeFile(metaFile, JSON.stringify(meta, null, 2), "utf8");
+  const restarted = await amend({ run_id: runId });
+  assert.equal(restarted.details.ok, true, "unchanged amend on errored run accepted: " + restarted.details.text);
+  assert.ok(restarted.details.text.includes("unchanged"), "restart note present");
+  const settled2 = await wait({ run_id: restarted.details.newRunId, timeout_ms: 15000 });
+  assert.ok(settled2.details.text.includes("completed"), "restart completes from cache");
+  assert.equal(asks.length, 1, "journal cache served the ask");
+
+  const live = await dashboard({ run_id: restarted.details.newRunId, live: true });
+  const wp = live.details.widgetParams;
+  assert.ok(wp, "live widget params returned");
+  assert.equal(wp.name, "zcode-workflow-live-" + restarted.details.newRunId);
+  assert.ok(wp.widget_code.includes(restarted.details.newRunId), "run id injected");
+  assert.deepEqual(wp.capabilities.tools, ["zcode-workflow.runs"]);
+  assert.ok(!wp.widget_code.includes("__RUN_ID__"), "placeholder replaced");
+  const card = await dashboard({ run_id: restarted.details.newRunId });
+  assert.equal(card.details.dashboardParams.pluginKind, "session:report");
+
+  await fs.rm(dir, { recursive: true, force: true });
 }
 
 console.log("smoke: all assertions passed");

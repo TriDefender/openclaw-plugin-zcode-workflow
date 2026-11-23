@@ -1,7 +1,7 @@
-<!-- RETIRED: live status is a native session:report card. Do not mount this file; its sandbox origin is loopback-only. -->
-<!-- ZCode workflow live status widget. Mounted via show_widget (pin: true) with
-     the `zcode-workflow.runs` dashboard data-binding grant. Polls the binding
-     and re-renders; __RUN_ID__ is replaced by the workflow_dashboard tool. -->
+<!-- ZCode workflow live status widget. Mounted via show_widget (pin: true) with the
+     zcode-workflow.runs dashboard data-binding grant; polls the binding every 2.5s
+     and re-renders, so it follows a background run with no further agent turns.
+     __RUN_ID__ is replaced by workflow_dashboard { live: true }. -->
 <div id="wf-dash" style="padding:0">
   <div class="row" style="align-items:center; gap:8px; flex-wrap:wrap">
     <strong id="wf-name" style="font-size:1.05em">Workflow…</strong>
@@ -34,7 +34,6 @@
   var RUN_ID = "__RUN_ID__";
   var BINDING = "zcode-workflow.runs";
   var hasHostApi = typeof window.openclaw !== "undefined" && window.openclaw && typeof window.openclaw.data !== "undefined";
-  var lastOk = null;
   var timer = null;
 
   var STATE_BADGE = {
@@ -55,6 +54,7 @@
     waiting_question: "等待回答子代理提问",
     superseded: "已被修订取代"
   };
+  var PHASE_TEXT = { pending: ["·", ""], current: ["进行中", "info"], done: ["✓", "ok"] };
 
   function esc(text) {
     return String(text == null ? "" : text)
@@ -69,55 +69,80 @@
     return m > 0 ? (m + "分" + (s < 10 ? "0" : "") + s + "秒") : (s + "秒");
   }
 
+  function badge(kind, text) {
+    return '<span class="badge' + (kind ? " " + kind : "") + '">' + esc(text) + "</span>";
+  }
+
   function render(run) {
     var root = document.getElementById("wf-dash");
-    if (!run) {
-      document.getElementById("wf-name").textContent = "未找到 run";
-      document.getElementById("wf-id").textContent = RUN_ID;
-      return;
-    }
+    if (!root || !run) return;
     document.getElementById("wf-name").textContent = run.name || run.id;
     document.getElementById("wf-id").textContent = run.id;
     var stateEl = document.getElementById("wf-state");
     stateEl.textContent = STATE_TEXT[run.state] || run.state;
     stateEl.className = "badge" + (STATE_BADGE[run.state] ? " " + STATE_BADGE[run.state] : "");
-    document.getElementById("wf-elapsed").textContent = "耗时 " + fmtMs(run.elapsedMs);
+    document.getElementById("wf-elapsed").textContent = run.elapsedMs != null ? "耗时 " + fmtMs(run.elapsedMs) : "";
 
-    // waiting banner
+    // waiting / error banner
     var banner = document.getElementById("wf-banner");
     if (run.pendingHole) {
       banner.style.display = "";
       banner.innerHTML =
-        '<span class="badge warn">hole</span> 等待填充 <code>' + esc(run.pendingHole.id) +
-        '</code>「' + esc(run.pendingHole.name) + '」&lt;' + esc(run.pendingHole.typeName) + '&gt;' +
-        (run.pendingHole.prompt ? '<div class="muted" style="margin-top:4px">' + esc(run.pendingHole.prompt).slice(0, 300) + '</div>' : "") +
+        badge("warn", "hole") + " 等待填充 <code>" + esc(run.pendingHole.id) +
+        "</code>「" + esc(run.pendingHole.name) + "」&lt;" + esc(run.pendingHole.typeName) + "&gt;" +
+        (run.pendingHole.prompt ? '<div class="muted" style="margin-top:4px">' + esc(String(run.pendingHole.prompt).slice(0, 300)) + "</div>" : "") +
         '<div class="muted" style="margin-top:4px">用 workflow_fill_hole 继续。</div>';
     } else if (run.pendingQuestions && run.pendingQuestions.length > 0) {
       banner.style.display = "";
       banner.innerHTML = run.pendingQuestions.map(function (q) {
-        return '<span class="badge warn">提问</span> 子代理 <strong>' + esc(q.agent) + '</strong>（' + esc(q.id) + '）：' + esc(q.question) +
+        return badge("warn", "提问") + " 子代理 <strong>" + esc(q.agent) + "</strong>（" + esc(q.id) + "）：" + esc(q.question) +
           '<div class="muted" style="margin-top:4px">用 workflow_resolve_question 回答。</div>';
       }).join("");
     } else if (run.state === "errored" && run.error) {
       banner.style.display = "";
-      banner.innerHTML = '<span class="badge danger">错误</span><div class="muted" style="margin-top:4px; font-family:var(--font-mono); white-space:pre-wrap">' + esc(run.error).slice(0, 400) + '</div>';
+      banner.innerHTML = badge("danger", "错误") + '<div class="muted" style="margin-top:4px; font-family:var(--font-mono); white-space:pre-wrap">' + esc(String(run.error).slice(0, 400)) + "</div>";
+    } else if (run.state === "stopped" && run.error) {
+      banner.style.display = "";
+      banner.innerHTML = badge("warn", "停止") + '<div class="muted" style="margin-top:4px">' + esc(String(run.error).slice(0, 300)) + "</div>";
     } else {
       banner.style.display = "none";
       banner.innerHTML = "";
     }
 
-    // phases timeline: declared phases with seen marks; fall back to seen-only
-    var declared = run.phasesDeclared || [];
-    var seen = run.phasesSeen || [];
-    var order = declared.length > 0 ? declared : seen;
-    var current = run.currentPhase || seen[seen.length - 1];
-    var phasesHtml = order.map(function (p) {
-      var idx = seen.indexOf(p);
-      var isCurrent = p === current && (run.state === "running" || run.state === "waiting_hole" || run.state === "waiting_question");
-      var done = run.state === "completed" || idx >= 0;
-      var mark = isCurrent ? '<span class="badge info">进行中</span>' : (done ? '<span class="badge ok">✓</span>' : '<span class="badge">·</span>');
-      return '<div class="row" style="gap:8px; align-items:center">' + mark + '<span' + (isCurrent ? ' style="font-weight:600"' : "") + '>' + esc(p) + '</span></div>';
-    }).join("");
+    // phase board: one row per phase with progress + status; sub-rows per work item
+    var phasesHtml = "";
+    var board = run.phaseBoard || [];
+    if (board.length > 0) {
+      var waiting = run.state === "waiting_hole" || run.state === "waiting_question";
+      phasesHtml = board.slice(0, 40).map(function (phase) {
+        var mark = PHASE_TEXT[phase.status] || PHASE_TEXT.pending;
+        var label = phase.status === "current" && waiting ? "等待" : mark[0];
+        var kind = phase.status === "current" && waiting ? "warn" : mark[1];
+        var row = '<div class="row" style="gap:8px; align-items:center">' + badge(kind, label) +
+          '<span' + (phase.status === "current" ? ' style="font-weight:600"' : "") + ">" + esc(phase.name) + "</span>" +
+          '<span class="muted" style="margin-left:auto; font-size:.85em">' + esc(phase.progress) + "</span></div>";
+        (phase.items || []).forEach(function (item) {
+          var itemMark = item.failed > 0 ? item.failed + " 次失败" : phase.status === "current" ? "进行中" : "✓";
+          row += '<div class="row" style="gap:8px; align-items:center; padding-left:18px">' +
+            '<span class="muted">· ' + esc(item.label) + "</span>" +
+            '<span class="muted" style="margin-left:auto; font-size:.85em">' + esc(item.count + " " + item.unit) +
+            (item.failed > 0 ? ' <span style="color:var(--danger, #c0392b)">' : " <span class=\"muted\">") + esc(itemMark) + "</span></span></div>";
+        });
+        return row;
+      }).join("");
+    } else {
+      // fallback: declared phases with seen marks
+      var declared = run.phasesDeclared || [];
+      var seen = run.phasesSeen || [];
+      var order = declared.length > 0 ? declared : seen;
+      var current = run.currentPhase || seen[seen.length - 1];
+      phasesHtml = order.map(function (p) {
+        var isCurrent = p === current && (run.state === "running" || run.state === "waiting_hole" || run.state === "waiting_question");
+        var done = run.state === "completed" || seen.indexOf(p) >= 0;
+        var mark = isCurrent ? badge("info", "进行中") : done ? badge("ok", "✓") : badge("", "·");
+        return '<div class="row" style="gap:8px; align-items:center">' + mark + '<span' + (isCurrent ? ' style="font-weight:600"' : "") + ">" + esc(p) + "</span></div>";
+      }).join("");
+    }
     document.getElementById("wf-phases").innerHTML =
       '<div class="muted" style="font-size:.8em; margin-bottom:6px">阶段</div>' +
       (phasesHtml || '<span class="muted">—</span>');
@@ -130,26 +155,24 @@
       { label: "artifacts", value: (run.artifacts || []).length }
     ];
     document.getElementById("wf-metrics").innerHTML = metrics.map(function (m) {
-      return '<div class="metric" style="min-width:70px"><div style="font-size:1.2em; font-weight:700">' + esc(m.value) + '</div><div class="muted" style="font-size:.75em">' + esc(m.label) + '</div></div>';
+      return '<div class="metric" style="min-width:70px"><div style="font-size:1.2em; font-weight:700">' + esc(m.value) + '</div><div class="muted" style="font-size:.75em">' + esc(m.label) + "</div></div>";
     }).join("");
 
-    // logs
     var logs = run.recentLogs || [];
     document.getElementById("wf-logs").textContent = logs.length > 0 ? logs.map(function (l) { return "· " + l; }).join("\n") : "—";
 
-    // reports
     var reports = run.recentReports || [];
     document.getElementById("wf-reports").innerHTML = reports.length > 0
       ? reports.map(function (r) {
           var text = typeof r.item === "string" ? r.item : JSON.stringify(r.item);
-          return '<div style="margin-bottom:4px">' + (r.artifactId ? '<span class="badge">' + esc(r.artifactId) + '</span> ' : "") + esc(String(text).slice(0, 160)) + '</div>';
+          return '<div style="margin-bottom:4px">' + (r.artifactId ? badge("", r.artifactId) + " " : "") + esc(String(text).slice(0, 160)) + "</div>";
         }).join("")
       : "—";
 
     var errEl = document.getElementById("wf-error");
-    if (run.result != null && (run.state === "completed")) {
+    if (run.result != null && run.state === "completed") {
       var summary = typeof run.result === "object" && run.result && run.result.conclusion ? String(run.result.conclusion) : JSON.stringify(run.result);
-      errEl.innerHTML = '<span class="badge ok">结论</span> ' + esc(summary).slice(0, 400);
+      errEl.innerHTML = badge("ok", "结论") + " " + esc(String(summary).slice(0, 400));
     } else {
       errEl.textContent = "";
     }
@@ -162,7 +185,6 @@
       return;
     }
     window.openclaw.data.read(BINDING, { runId: RUN_ID }).then(function (data) {
-      lastOk = data;
       document.getElementById("wf-error").textContent = "";
       render(data && data.run);
     }).catch(function (err) {
@@ -170,19 +192,23 @@
     });
   }
 
+  function startPolling() {
+    tick();
+    timer = setInterval(tick, 2500);
+  }
+
   if (!RUN_ID || RUN_ID === "__RUN_ID__") {
     // Self-heal: resolve the most recent run through the binding, then poll it.
     if (!hasHostApi) {
       document.getElementById("wf-name").textContent = "workflow_dashboard 未注入 runId";
       document.getElementById("wf-error").innerHTML =
-        '占位符未替换且无 openclaw.data 主机 API。请用 workflow_dashboard { run_id } 取得注入后的 widget_code 再 show_widget。';
+        '占位符未替换且无 openclaw.data 主机 API。请用 workflow_dashboard { run_id, live: true } 取得注入后的 widget_code 再 show_widget。';
     } else {
       window.openclaw.data.read(BINDING, {}).then(function (data) {
         var first = data && data.runs && data.runs[0];
         if (first && first.id) {
           RUN_ID = first.id;
-          tick();
-          timer = setInterval(tick, 2500);
+          startPolling();
         } else {
           document.getElementById("wf-name").textContent = "暂无 workflow run";
         }
@@ -191,8 +217,7 @@
       });
     }
   } else {
-    tick();
-    timer = setInterval(tick, 2500);
+    startPolling();
   }
 })();
 </script>
