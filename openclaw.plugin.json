@@ -40,6 +40,7 @@
       "workflow_eval_snippet",
       "workflow_save",
       "workflow_list_saved",
+      "workflow_submit",
       "workflow_dashboard"
     ]
   }
