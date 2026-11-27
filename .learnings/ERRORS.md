@@ -35,3 +35,8 @@ Append structured entries:
 - 现象: `phase("x"); const r = agent("a").ask(...); return {r}` → run 3ms 即 completed，ask fire-and-forget 之后落地，结果序列化为 {}。
 - 根因: 顶层语句不隐式 await ask()；箭头函数体（phase 第二参在旧版可行）或显式 await 才会等待。
 - 教训: 探针/示例脚本一律显式 await ask()，或回到编译器接受的函数体形状；验证 run 结果非空才算 ask 真正执行。
+
+### ERR-20261127-002 插件重载在回合中段被拒
+- 现象: dispatch_action plugins {action:"reload", pluginId:"zcode-workflow"} 在回合中段返回 UNAVAILABLE: Plugin cannot replace itself from its own active turn; retry after the turn finishes。
+- 原因: 网关禁止插件在它自己的活跃回合内自替换；此前的成功案例都是把 reload 作为回合收尾动作或回合结束后执行。
+- 处置: 把 reload 放在回合最后一步发出，或回合后由 automations 一次性任务（sessionTarget 本会话）重试；重载结果以新消息形式返回。
