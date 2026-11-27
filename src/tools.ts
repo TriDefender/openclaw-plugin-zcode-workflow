@@ -102,6 +102,22 @@ function owningAgentId(ctx: ToolContext): string {
   });
 }
 
+/** List workflow_submit payloads stored under a run's submissions/ directory (newest last). */
+async function listSubmissions(runDir: string): Promise<{ name: string; bytes: number }[]> {
+  const dir = path.join(runDir, "submissions");
+  try {
+    const files = (await fs.readdir(dir)).filter((f) => f.endsWith(".json")).sort();
+    const out: { name: string; bytes: number }[] = [];
+    for (const f of files) {
+      const st = await fs.stat(path.join(dir, f));
+      out.push({ name: f, bytes: st.size });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 function stampAgent(meta: RunMeta, ctx: ToolContext): void {
   if (!meta.agentId) meta.agentId = owningAgentId(ctx);
   // Provenance: which session invoked this run. The plugin always knows the
@@ -465,6 +481,13 @@ export function buildToolDefs(): ToolDef[] {
         const logs = journal.logs().slice(-15);
         if (logs.length > 0) lines.push("Logs:", ...logs.map((l) => `- ${l.message.slice(0, 200)}`));
       }
+      const submissions = await listSubmissions(store.runDir(meta.id));
+      if (submissions.length > 0) {
+        lines.push(
+          "Submissions (workflow_submit payloads):",
+          ...submissions.slice(-8).map((s) => `- ${s.name} (${s.bytes} bytes)`),
+        );
+      }
       if (meta.primaryArtifact) lines.push(`Primary artifact: ${meta.primaryArtifact} (under .zcode-workflow/artifacts/${meta.id}/)`);
       return text(lines.join("\n"));
     },
@@ -483,6 +506,74 @@ export function buildToolDefs(): ToolDef[] {
       if (runs.length === 0) return text("No workflow runs in this workspace yet.");
       const lines = runs.map((r) => `- ${r.id} "${r.name}" [${r.state}] phases: ${r.phases.join(" → ") || "(none)"}`);
       return text(lines.join("\n"));
+    },
+  });
+
+  // ---- workflow_submit (called by workflow subagents; see agents.ts SUBMIT_OUTPUT_CONTRACT) ----
+  tool({
+    name: "workflow_submit",
+    label: "Submit Workflow Payload",
+    description:
+      "Submit a structured JSON payload to the workflow run that owns this subagent session. " +
+      "The payload is validated and stored under the run's submissions/ directory. " +
+      'Only callable from workflow subagent sessions (persona tools: "submit").',
+    parameters: Type.Object({
+      data: Type.Any({ description: "The JSON payload — an object or array (a string containing JSON is parsed)." }),
+      note: Type.Optional(Type.String({ description: "Short human-readable note about the payload." })),
+    }),
+    handler: async (params, ctx) => {
+      const sessionKey = ctx.session?.sessionKey ?? "";
+      const m = /^agent:[^:]+:subagent:(dwf-[0-9a-z]+):([^:]+)$/.exec(sessionKey);
+      if (!m) {
+        return text(
+          `workflow_submit is only available inside a workflow subagent session ` +
+          `(agent:<agent>:subagent:<runId>:<name>); this session is "${sessionKey || "(unknown)"}". ` +
+          `Reply your structured data as text instead.`,
+        );
+      }
+      const [, runId, agentName] = m;
+      let payload: unknown = params.data;
+      if (typeof payload === "string") {
+        try {
+          payload = JSON.parse(payload);
+        } catch (err) {
+          return text(`workflow_submit: data was a string but not valid JSON (${(err as Error).message}). Resend valid JSON.`);
+        }
+      }
+      if (payload === null || typeof payload !== "object") {
+        return text("workflow_submit: the payload must be a JSON object or array — wrap scalars in an object. Nothing was stored.");
+      }
+      let serialized: string;
+      try {
+        serialized = JSON.stringify(payload, null, 2);
+      } catch {
+        return text("workflow_submit: the payload is not JSON-serializable. Nothing was stored.");
+      }
+      if (serialized.length > 262_144) {
+        return text(`workflow_submit: payload too large (${serialized.length} bytes; cap 262144). Trim or split the data. Nothing was stored.`);
+      }
+      const workspaceDir = workspaceOf(ctx);
+      const store = storeOf(ctx, workspaceDir);
+      let runDir: string;
+      try {
+        const meta = await loadRun(store, runId);
+        runDir = store.runDir(meta.id);
+      } catch {
+        return text(`workflow_submit: run ${runId} not found in workspace ${workspaceDir}. Nothing was stored.`);
+      }
+      const dir = path.join(runDir, "submissions");
+      await fs.mkdir(dir, { recursive: true });
+      const safeName = (agentName || "anon").replace(/[^A-Za-z0-9._-]/g, "_");
+      const existing = (await fs.readdir(dir)).filter((f) => f.startsWith(`${safeName}-`) && f.endsWith(".json"));
+      const file = path.join(dir, `${safeName}-${existing.length + 1}.json`);
+      const tmp = `${file}.tmp`;
+      await fs.writeFile(tmp, serialized);
+      await fs.rename(tmp, file);
+      const note = String((params as { note?: unknown }).note ?? "").slice(0, 200);
+      return text(
+        `Submitted ${path.basename(file)} (${serialized.length} bytes) to run ${runId}${note ? ` — ${note}` : ""}. ` +
+        `Mention this file in your final reply.`,
+      );
     },
   });
 

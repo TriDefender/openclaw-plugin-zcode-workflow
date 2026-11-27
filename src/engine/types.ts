@@ -89,6 +89,8 @@ export interface PendingQuestion {
   createdAt: string;
   /** Ask metadata when the escalating ask was typed. */
   askMeta?: AskMeta;
+  /** Tool policy of the escalating agent, reapplied on continuation runs. */
+  personaTools?: "none" | "submit";
 }
 
 export interface ReportedItem {

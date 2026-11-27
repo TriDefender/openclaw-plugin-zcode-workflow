@@ -18,6 +18,10 @@ export interface SubagentRuntime {
     provider?: string;
     promptMode?: "minimal";
     cwd?: string;
+    /** Remove every tool from the subagent's face (plugin subagent runs only). */
+    disableTools?: boolean;
+    /** Additively expose these plugin-owned tools besides the normal face. */
+    toolsAlsoAllow?: string[];
   }): Promise<{ runId: string; sessionKey?: string }>;
   waitForRun(params: { runId: string; timeoutMs: number }): Promise<{
     status: "ok" | "timeout" | "error" | "pending";
@@ -47,6 +51,34 @@ export interface Persona {
   model?: string;
   provider?: string;
   budgetWebSearch?: number;
+  /** Tool face: "none" removes every tool, "submit" adds the workflow_submit channel. */
+  tools?: "none" | "submit";
+}
+
+/**
+ * The plugin-owned tool workflow subagents use to hand structured payloads to the
+ * plugin (validated, stored under the run's submissions/ directory). Keep in sync
+ * with the tool registration name in tools.ts.
+ */
+export const WORKFLOW_SUBMIT_TOOL = "workflow_submit";
+
+const SUBMIT_OUTPUT_CONTRACT =
+  "\n\nOutput contract: when your final answer is structured data, call the " +
+  WORKFLOW_SUBMIT_TOOL +
+  " tool with the complete JSON payload in its `data` parameter BEFORE writing your final reply, " +
+  "then reply with one short confirmation line. Do not write result files to disk yourself.";
+
+/** Map a persona's tool policy onto the core subagent dispatch parameters. */
+export function toolFaceOf(persona: Persona | undefined): { disableTools?: boolean; toolsAlsoAllow?: string[] } {
+  if (persona?.tools === "none") return { disableTools: true };
+  if (persona?.tools === "submit") return { toolsAlsoAllow: [WORKFLOW_SUBMIT_TOOL] };
+  return {};
+}
+
+/** extraSystemPrompt for a persona, including the submit-tool output contract when enabled. */
+export function systemPromptOf(persona: Persona | undefined): string | undefined {
+  const submitNote = persona?.tools === "submit" ? SUBMIT_OUTPUT_CONTRACT : "";
+  return persona?.system || submitNote ? `${persona?.system ?? ""}${submitNote}` : undefined;
 }
 
 const ASK_WAIT_CHUNK_MS = 60_000;
@@ -115,7 +147,7 @@ export class SubagentPool {
   ): Promise<string> {
     const sessionKey = subagentSessionKey(this.agentId, this.runId, name, ordinal);
     const first = !this.askCounts.has(name ?? `#${ordinal}`) || (this.askCounts.get(name ?? `#${ordinal}`) ?? 0) === 0;
-    const extraSystemPrompt = persona?.system;
+    const extraSystemPrompt = systemPromptOf(persona);
     const modelParts = persona?.model?.includes("/") ? persona.model.split("/") : undefined;
 
     const release = await this.semaphore.acquire();
@@ -126,6 +158,7 @@ export class SubagentPool {
         extraSystemPrompt,
         promptMode: "minimal" as const,
         cwd: this.workspaceDir,
+        ...toolFaceOf(persona),
       };
       const wantsOverride = Boolean(modelParts || persona?.model || this.defaultModel);
       const dispatch = (): Promise<{ runId: string; sessionKey?: string }> =>
@@ -180,11 +213,18 @@ export class SubagentPool {
   }
 
   /** Direct continuation (used by workflow_resolve_question to answer an escalation in place). */
-  async continueAsk(name: string | undefined, ordinal: number, message: string): Promise<string> {
+  async continueAsk(name: string | undefined, ordinal: number, persona: Persona | undefined, message: string): Promise<string> {
     const sessionKey = subagentSessionKey(this.agentId, this.runId, name, ordinal);
     const release = await this.semaphore.acquire();
     try {
-      const { runId: subRunId } = await this.runtime.run({ sessionKey, message, promptMode: "minimal", cwd: this.workspaceDir });
+      const { runId: subRunId } = await this.runtime.run({
+        sessionKey,
+        message,
+        extraSystemPrompt: systemPromptOf(persona),
+        promptMode: "minimal",
+        cwd: this.workspaceDir,
+        ...toolFaceOf(persona),
+      });
       const wait = await this.runtime.waitForRun({ runId: subRunId, timeoutMs: 10 * 60_000 });
       while (wait.status === "pending" || wait.status === "timeout") {
         const again = await this.runtime.waitForRun({ runId: subRunId, timeoutMs: ASK_WAIT_CHUNK_MS });

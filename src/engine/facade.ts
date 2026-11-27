@@ -23,7 +23,7 @@ declare function model(id: string): ModelRef;
 `;
 
 const AGENT_SECTION = `\
-/** Persona of a subagent, fixed when agent() creates it. Every subagent has the same working tools. */
+/** Persona of a subagent, fixed when agent() creates it. */
 declare interface AgentPersona {
   /** System prompt describing the actor's role. */
   system?: string;
@@ -31,6 +31,21 @@ declare interface AgentPersona {
   model?: ModelRef | string;
   /** WebSearch calls per ask (integer literal, at most 1024); omitted = 128. */
   budget?: { webSearch?: number };
+  /**
+   * Tool face for this subagent:
+   * - "none": every tool is removed. The whole task input must arrive inside the ask()
+   *   instructions and the reply text is the only output channel (pair with ask<T>()).
+   * - "submit": the normal tools are kept and the workflow_submit channel is added.
+   *   The subagent hands structured payloads to the plugin (validated, stored under the
+   *   run's submissions/ directory) instead of writing result files itself.
+   * Omitted: unchanged default tools.
+   */
+  tools?: "none" | "submit";
+  /**
+   * Default answer schema (a JSON Schema value). Every ask() on this agent without a type
+   * argument is validated against it; an explicit ask<T>() overrides it.
+   */
+  replySchema?: unknown;
 }
 
 /**

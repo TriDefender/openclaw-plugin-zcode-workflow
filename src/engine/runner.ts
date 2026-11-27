@@ -306,7 +306,7 @@ export class WorkflowRunner {
       (typed ? ` Reply again with a single JSON value matching the interface from before (no prose).` : "");
     let reply: string;
     try {
-      reply = await pool.continueAsk(question.agentName || undefined, question.agentOrdinal, continuation);
+      reply = await pool.continueAsk(question.agentName || undefined, question.agentOrdinal, { tools: question.personaTools }, continuation);
     } catch (err) {
       throw new WorkflowError(`answering the escalation failed: ${(err as Error).message}`, "ask_failed");
     }
@@ -407,21 +407,40 @@ export class WorkflowRunner {
     // ---- facade ----
     const facade: Record<string, unknown> = {
       agent: (name?: string, persona?: unknown) => {
-        const personaObj: { system?: string; model?: string; budget?: { webSearch?: number } } = {};
+        const personaObj: {
+          system?: string;
+          model?: string;
+          budget?: { webSearch?: number };
+          tools?: "none" | "submit";
+          replySchema?: unknown;
+        } = {};
         if (typeof persona === "string") personaObj.system = persona;
         else if (persona && typeof persona === "object") {
-          const p = persona as { system?: string; model?: string | { __modelRef?: string }; budget?: { webSearch?: number } };
+          const p = persona as {
+            system?: string;
+            model?: string | { __modelRef?: string };
+            budget?: { webSearch?: number };
+            tools?: "none" | "submit";
+            replySchema?: unknown;
+          };
           personaObj.system = p.system;
           personaObj.model =
             typeof p.model === "string" ? p.model : p.model && typeof p.model === "object" && "__modelRef" in p.model ? String(p.model.__modelRef) : undefined;
           personaObj.budget = p.budget;
+          personaObj.tools = p.tools === "none" || p.tools === "submit" ? p.tools : undefined;
+          personaObj.replySchema = p.replySchema;
         }
         pool.registerName(name);
         const ordinal = agentOrdinal++;
         return {
           ask: async (instructions: string, metaJson?: string) => {
             guard();
-            const askMeta = metaJson === undefined ? undefined : (JSON.parse(metaJson) as AskMeta);
+            const askMeta =
+              metaJson !== undefined
+                ? (JSON.parse(metaJson) as AskMeta)
+                : personaObj.replySchema !== undefined && personaObj.replySchema !== null
+                  ? ({ typeName: "persona replySchema", source: "persona.replySchema", schema: personaObj.replySchema } as AskMeta)
+                  : undefined;
             const agentIndex = pool.nextAskIndex(name, ordinal);
             if (cacheOpen) {
               const cached = journal.lookupAsk(name, agentIndex, instructions);
@@ -456,14 +475,14 @@ export class WorkflowRunner {
               }
               const escalation = asEscalation(parsed.value);
               if (escalation) {
-                throw new EscalationSignal(makeQuestion(meta, name, ordinal, agentIndex, instructions, askMeta, escalation));
+                throw new EscalationSignal(makeQuestion(meta, name, ordinal, agentIndex, instructions, askMeta, escalation, personaObj.tools));
               }
               await journal.append({ kind: "ask", agent: name ?? `#${ordinal}`, agentIndex, instructions, result: parsed.value, typed: true });
               return parsed.value;
             }
             const escalation = detectUntypedEscalation(text);
             if (escalation) {
-              throw new EscalationSignal(makeQuestion(meta, name, ordinal, agentIndex, instructions, undefined, escalation));
+              throw new EscalationSignal(makeQuestion(meta, name, ordinal, agentIndex, instructions, undefined, escalation, personaObj.tools));
             }
             await journal.append({ kind: "ask", agent: name ?? `#${ordinal}`, agentIndex, instructions, result: text, typed: false });
             return text;
@@ -838,6 +857,7 @@ function makeQuestion(
   instructions: string,
   askMeta: AskMeta | undefined,
   escalation: { question: string; evidence: string | undefined },
+  personaTools?: "none" | "submit",
 ): PendingQuestion {
   return {
     id: `dwfq-${Math.random().toString(36).slice(2, 10)}`,
@@ -851,6 +871,7 @@ function makeQuestion(
     evidence: escalation.evidence,
     createdAt: new Date().toISOString(),
     askMeta,
+    personaTools,
   };
 }
 
