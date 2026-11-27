@@ -104,6 +104,8 @@ export interface RunMeta {
   state: RunState;
   /** Agent that owns this run's subagent sessions. Stamped at start; never guessed later. */
   agentId?: string;
+  /** Session key that invoked this run, when the calling turn exposed one. Provenance only. */
+  invokerSessionKey?: string;
   createdAt: string;
   updatedAt: string;
   /** Run this one amends, if any. */

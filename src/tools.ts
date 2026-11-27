@@ -104,6 +104,12 @@ function owningAgentId(ctx: ToolContext): string {
 
 function stampAgent(meta: RunMeta, ctx: ToolContext): void {
   if (!meta.agentId) meta.agentId = owningAgentId(ctx);
+  // Provenance: which session invoked this run. The plugin always knows the
+  // calling session here (ctx.session) — persist it so runs are traceable
+  // even without notify, and so subagent lineage is answerable later.
+  if (!meta.invokerSessionKey && ctx.session?.sessionKey) {
+    meta.invokerSessionKey = ctx.session.sessionKey;
+  }
 }
 
 /**
