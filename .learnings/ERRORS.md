@@ -40,3 +40,8 @@ Append structured entries:
 - 现象: dispatch_action plugins {action:"reload", pluginId:"zcode-workflow"} 在回合中段返回 UNAVAILABLE: Plugin cannot replace itself from its own active turn; retry after the turn finishes。
 - 原因: 网关禁止插件在它自己的活跃回合内自替换；此前的成功案例都是把 reload 作为回合收尾动作或回合结束后执行。
 - 处置: 把 reload 放在回合最后一步发出，或回合后由 automations 一次性任务（sessionTarget 本会话）重试；重载结果以新消息形式返回。
+
+### ERR-20261127-003 插件自重载守卫比预期更严：本会话任何回合都被拒，openclaw 委托走 gateway.restart
+- 现象: ERR-20261127-002 的"回合最后动作"模式在本环境不成立——mid-turn、automation 回合首个动作、automation 回合末个动作三次 reload 全部被拒（同 UNAVAILABLE: cannot replace itself from its own active turn）。此前 0.1.7/0.1.8 的成功疑似走了不同执行路径。
+- 处置: 本会话内不再重试 reload；用 openclaw 工具委托系统回合处理。委托实际调度了受监督的 gateway.restart（reload 的超集，重启后从磁盘加载新 dist）。重启安全、会话自动恢复。
+- 教训: 插件更新发版流程定型为: build+sync+push → openclaw 委托重载（预期 gateway.restart）→ 重启后 plugins list 验证版本。
